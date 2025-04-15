@@ -186,36 +186,62 @@ load_gadm <- function(i) {
     list_rbind()
 }
 
-class(load_gadm(1))  # sf
-
-tmap_mode("view") 
+# class(load_gadm(1))  # sf
+# 
+# tmap_mode("view") 
 # qtm(load_gadm(1)) 
 
 
-#############################################################
+brazil <- load_gadm(0)
+brazil <- st_transform(brazil, crs = 4326)
+
+roi <- load_gadm(1)  # 27 administrative regions
+roi_vect <- vect(roi)
+roi_vect <- project(roi_vect, "EPSG:4326")  # Match CRS
 
 
+###########################################################
+
+
+
+# Initialize directories and paths
 lightout_dir <- "Lightning/Masked"
+raster_dir <- "Lightning/Rasters"
+dir.create(lightout_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(raster_dir, showWarnings = FALSE, recursive = TRUE)
+
+# File paths
 lightning_sf_path <- file.path(lightout_dir, "lightning_sf.rds")
 all_lightning_path <- file.path(lightout_dir, "all_lightning.rds")
 
-# Create directory if needed
-if (!dir.exists(lightout_dir)) {
-  dir.create(lightout_dir, recursive = TRUE)
-}
+# Check if processing is needed
+needs_processing <- !all(file.exists(c(
+  lightning_sf_path,
+  all_lightning_path,
+  file.path(raster_dir, "density_5m.tif"),
+  file.path(raster_dir, "power_mean.tif"),
+  file.path(raster_dir, "power_median.tif"), 
+  file.path(raster_dir, "power_sd.tif")
+)))
 
-# Check and load or process
-if (file.exists(lightning_sf_path) && file.exists(all_lightning_path)) {
+if (!needs_processing) {
   tryCatch({
+    # Load all pre-processed data
     lightning_sf <- readRDS(lightning_sf_path)
     all_lightning <- readRDS(all_lightning_path)
-    message("Successfully loaded pre-processed data")
+    density_5m <- rast(file.path(raster_dir, "density_5m.tif"))
+    power_mean <- rast(file.path(raster_dir, "power_mean.tif")) 
+    power_median <- rast(file.path(raster_dir, "power_median.tif"))
+    power_sd <- rast(file.path(raster_dir, "power_sd.tif"))
+    message("Successfully loaded all pre-processed data")
   }, error = function(e) {
-    message("Error loading saved files, reprocessing...")
-    source_process_lightning()  # You could wrap your processing code in a function
+    message("Error loading saved files: ", e$message)
+    needs_processing <<- TRUE
   })
-} else {
-  
+}
+
+if (needs_processing) {
+  message("Processing data...")
   
   # ---------------------------------------------
   # 1. Load GADM level 1 (Brazil states)
@@ -248,8 +274,6 @@ if (file.exists(lightning_sf_path) && file.exists(all_lightning_path)) {
   
   # Clean date-only names like "2017_01"
   names(density_5m) <- format(dates, "%Y_%m")
-  
-  names(density_5m)
   
   # ---------------------------------------------
   # 3. Load and subset stroke power rasters (30 arc-min)
@@ -289,7 +313,6 @@ if (file.exists(lightning_sf_path) && file.exists(all_lightning_path)) {
     return(df_long)
   }
   
-  
   # Apply the function to each raster
   density_df     <- extract_mean_df(density_5m, "density")
   powermean_df   <- extract_mean_df(power_mean, "power_mean")
@@ -305,22 +328,33 @@ if (file.exists(lightning_sf_path) && file.exists(all_lightning_path)) {
   )
   
   # ---------------------------------------------
-  # 6. Optional: Convert to sf and Add Geometry
+  # 6. Convert to sf and Add Geometry
   # ---------------------------------------------
   roi_df <- st_as_sf(roi)
   lightning_sf <- left_join(roi_df, all_lightning, by = "NAME_1")
   
-  
-  # Save results with compression
+  # After processing, save results
   saveRDS(lightning_sf, lightning_sf_path, compress = "xz")
   saveRDS(all_lightning, all_lightning_path, compress = "xz")
-  message("Saved processed data with compression")
+  
+  # Save rasters
+  writeRaster(density_5m, file.path(raster_dir, "density_5m.tif"), overwrite = TRUE)
+  writeRaster(power_mean, file.path(raster_dir, "power_mean.tif"), overwrite = TRUE)
+  writeRaster(power_median, file.path(raster_dir, "power_median.tif"), overwrite = TRUE)
+  writeRaster(power_sd, file.path(raster_dir, "power_sd.tif"), overwrite = TRUE)
+  
+  message("Data processing complete and saved")
 }
+
+
+########################
+
+### below likely needs to be fixed because data format/names changed. 
 
 # ---------------------------------------------
 # 6. Quick Visualization for Jan 2017
 # ---------------------------------------------
-r_tmap <- lightning[[1]]
+r_tmap <- density_5m[[1]]
 names(r_tmap) <- "density2017_01"  # Optional rename for display
 
 tm_shape(r_tmap) +
@@ -341,6 +375,50 @@ cat("Percent NA:", round(sum(is.na(vals)) / length(vals) * 100, 2), "%\n")
 
 summary(lightning_sf$date)
 
+
+
+# Initialize directories
+lightout_dir <- "Lightning/Masked"  # Fixed typo
+raster_dir <- "Lightning/Rasters"
+dir.create(lightout_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(raster_dir, showWarnings = FALSE, recursive = TRUE)
+
+# File paths
+lightning_sf_path <- file.path(lightout_dir, "lightning_sf.rds")
+all_lightning_path <- file.path(lightout_dir, "all_lightning.rds")
+
+# Check if processing is needed
+needs_processing <- !all(file.exists(c(lightning_sf_path, all_lightning_path,
+                                     file.path(raster_dir, "density_5m.tif")))
+
+if (!needs_processing) {
+  tryCatch({
+    lightning_sf <- readRDS(lightning_sf_path)
+    all_lightning <- readRDS(all_lightning_path)
+    message("Successfully loaded pre-processed data")
+  }, error = function(e) {
+    message("Error loading saved files: ", e$message)
+    needs_processing <<- TRUE
+  })
+}
+
+if (needs_processing) {
+  message("Processing data...")
+  
+  # [Your full processing code here]
+  
+  # Save results
+  saveRDS(lightning_sf, lightning_sf_path, compress = "xz")
+  saveRDS(all_lightning, all_lightning_path, compress = "xz")
+  
+  # Save rasters (force overwrite)
+  writeRaster(density_5m, file.path(raster_dir, "density_5m.tif"), overwrite = TRUE)
+  writeRaster(power_mean, file.path(raster_dir, "power_mean.tif"), overwrite = TRUE)
+  writeRaster(power_median, file.path(raster_dir, "power_median.tif"), overwrite = TRUE)
+  writeRaster(power_sd, file.path(raster_dir, "power_sd.tif"), overwrite = TRUE)
+  
+  message("Data processing complete and saved")
+}
 
 ########################################################################
 
