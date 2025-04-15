@@ -1,0 +1,19 @@
+# Ignore data and large files
+*.rds
+*.csv
+*.tif
+*.nc
+*.RData*
+.RDataTmp
+.DS_Store
+
+# Ignore folders that store data
+ANEEL/
+GADM/
+WGLC/
+
+# RStudio-related
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
