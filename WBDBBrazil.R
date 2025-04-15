@@ -30,6 +30,9 @@ library(MODIStsp)
 library(httr)
 library(tidyverse)
 library(readxl)
+library(terra)
+
+
 
 
 wb <- read_excel("~/Outages/WBDB/WB-DB.xlsx")
@@ -38,9 +41,9 @@ br <- wb %>%
 
 saidi <- br %>% 
   filter(br$`Indicator ID` == "WB.DB.58" |
-         br$`Indicator ID` == "WB.DB.55" | 
-         br$`Indicator ID` == "WB.DB.56" |
-         br$`Indicator ID` == "WB.DB.57" )
+           br$`Indicator ID` == "WB.DB.55" | 
+           br$`Indicator ID` == "WB.DB.56" |
+           br$`Indicator ID` == "WB.DB.57" )
 
 # Getting electricity : System average interruption duration index (SAIDI) (DB16-20 methodology)
 # Getting electricity : System average interruption frequency index (SAIFI) (DB16-20 methodology)
@@ -277,6 +280,61 @@ tmap_mode("view")
 qtm(load_gadm(1)) 
 
 
-# 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
+
+
+###################################################
+
+# Convert roi (sf) to SpatVector and match CRS
+roi_vect <- vect(roi)
+roi_vect <- project(roi_vect, crs(lightning))
+
+# Extract mean lightning density per polygon, per month
+lightning_data <- terra::extract(lightning, roi_vect, fun = mean, na.rm = TRUE)
+
+# Prepare column names (region ID + 60 months from 2017–2021)
+dates <- seq.Date(from = as.Date("2017-01-01"), by = "month", length.out = nlyr(lightning))
+names(lightning_data) <- c("region", paste0("density", format(dates, "%Y_%m")))
+
+# Combine lightning data back with the geometry
+lightning_sf <- cbind(roi_vect, lightning_data)
+lightning_sf <- st_as_sf(lightning_sf)  # convert to sf for plotting
+
+# Compute yearly mean for 2019
+lightning_sf$mean_2019 <- lightning_sf %>%
+  st_drop_geometry() %>%
+  select(starts_with("density2019_")) %>%
+  rowMeans(na.rm = TRUE)
+
+# Plot!
+tmap_mode("plot")  # or "view" for interactive mode
+
+tm_shape(lightning_sf) +
+  tm_polygons("mean_2019", 
+              title = "Avg Lightning Density\n(2019, strokes/km²)") +
+  tm_layout(frame = FALSE)
+
+
+lightning_sf$mean_2020 <- lightning_sf %>%
+  st_drop_geometry() %>%
+  select(starts_with("density2020_")) %>%
+  rowMeans(na.rm = TRUE)
+
+colnames(lightning_sf)
+
+
+# Plot!
+tmap_mode("plot")  # or "view" for interactive mode
+
+tm_shape(lightning_sf) +
+  tm_polygons("mean_2020", 
+              title = "Avg Lightning Density\n(2020, strokes/km²)") +
+  tm_layout(frame = FALSE)
+
+
+tm_shape(lightning_sf) +
+  tm_polygons("density2018_09", 
+              title = "Avg Lightning Density\n(2020, strokes/km²)") +
+  tm_layout(frame = FALSE)
+
 
 
