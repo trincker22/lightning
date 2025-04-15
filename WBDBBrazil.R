@@ -167,94 +167,6 @@ if (!file.exists(output_path)) {
 }
 
 
-
-#############################################################
-# ---------------------------------------------
-# Load Required Libraries
-# ---------------------------------------------
-library(terra)
-library(lubridate)
-library(sf)
-library(tmap)
-
-# ---------------------------------------------
-# 0. Set Output Path and Check If File Already Exists
-# ---------------------------------------------
-processed_path <- "~/Outages/Lightning/Masked/lightning_brazil_2017.tif"
-
-if (!file.exists(processed_path)) {
-  
-  # ---------------------------------------------
-  # 1. Load Lightning Raster Data (NetCDF)
-  # ---------------------------------------------
-  lightning <- rast("~/Outages/Lightning/WGLC/wglc_timeseries_05m.nc")
-  names(lightning)
-  print(lightning)
-  
-  # ---------------------------------------------
-  # 2. Load, Transform, and Convert Brazil Boundary
-  # ---------------------------------------------
-  brazil <- st_read("~/NTL/data/gadm/shp") |>
-    st_transform(crs = 4326) |>
-    vect()
-  
-  # ---------------------------------------------
-  # 3. Crop and Mask Lightning Data to Brazil
-  # ---------------------------------------------
-  lightning <- mask(crop(lightning, brazil), brazil)
-  
-  # ---------------------------------------------
-  # 4. Subset Data from Jan 2017 Onward and Convert to Monthly Strokes
-  # ---------------------------------------------
-  dates <- seq.Date(from = as.Date("2010-01-01"), by = "month", length.out = nlyr(lightning))
-  start_index <- which(dates == as.Date("2017-01-01"))
-  dates <- dates[start_index:nlyr(lightning)]
-  days <- days_in_month(dates)
-  
-  lightning <- lightning[[start_index:nlyr(lightning)]]
-  
-  for (i in 1:nlyr(lightning)) {
-    lightning[[i]] <- lightning[[i]] * days[i]
-  }
-  
-  # ---------------------------------------------
-  # 5. Save Processed Raster
-  # ---------------------------------------------
-  writeRaster(lightning, processed_path, overwrite = TRUE)
-  cat("Processed lightning raster saved to:", processed_path, "\n")
-  
-} else {
-  # ---------------------------------------------
-  # Load Existing File
-  # ---------------------------------------------
-  lightning <- rast(processed_path)
-  cat("Processed lightning raster already exists. Loaded from:", processed_path, "\n")
-}
-
-# ---------------------------------------------
-# 6. Quick Visualization for Jan 2017
-# ---------------------------------------------
-r_tmap <- lightning[[1]]
-names(r_tmap) <- "density"
-
-tm_shape(r_tmap) +
-  tm_raster(title = "Strokes/km²", style = "cont") +
-  tm_shape(brazil) +
-  tm_borders(col = "black")
-
-# ---------------------------------------------
-# 7. NA Analysis 
-# ---------------------------------------------
-na_map <- is.na(lightning[[1]])
-plot(na_map, main = "NA regions in Jan 2017 (white = NA)")
-lines(brazil, col = "red")
-
-vals <- values(lightning[[1]])
-cat("Percent NA:", round(sum(is.na(vals)) / length(vals) * 100, 2), "%\n")
-
-
-
-
 #################################################
 
 iso3_code <- "BRA"
@@ -277,64 +189,182 @@ load_gadm <- function(i) {
 class(load_gadm(1))  # sf
 
 tmap_mode("view") 
-qtm(load_gadm(1)) 
+# qtm(load_gadm(1)) 
 
 
+#############################################################
 
 
-###################################################
+lightout_dir <- "Lightning/Masked"
+lightning_sf_path <- file.path(lightout_dir, "lightning_sf.rds")
+all_lightning_path <- file.path(lightout_dir, "all_lightning.rds")
 
-# Convert roi (sf) to SpatVector and match CRS
-roi_vect <- vect(roi)
-roi_vect <- project(roi_vect, crs(lightning))
+# Create directory if needed
+if (!dir.exists(lightout_dir)) {
+  dir.create(lightout_dir, recursive = TRUE)
+}
 
-# Extract mean lightning density per polygon, per month
-lightning_data <- terra::extract(lightning, roi_vect, fun = mean, na.rm = TRUE)
+# Check and load or process
+if (file.exists(lightning_sf_path) && file.exists(all_lightning_path)) {
+  tryCatch({
+    lightning_sf <- readRDS(lightning_sf_path)
+    all_lightning <- readRDS(all_lightning_path)
+    message("Successfully loaded pre-processed data")
+  }, error = function(e) {
+    message("Error loading saved files, reprocessing...")
+    source_process_lightning()  # You could wrap your processing code in a function
+  })
+} else {
+  
+  
+  # ---------------------------------------------
+  # 1. Load GADM level 1 (Brazil states)
+  # ---------------------------------------------
+  brazil <- load_gadm(0)
+  brazil <- st_transform(brazil, crs = 4326)
+  
+  roi <- load_gadm(1)  # 27 administrative regions
+  roi_vect <- vect(roi)
+  roi_vect <- project(roi_vect, "EPSG:4326")  # Match CRS
+  
+  # ---------------------------------------------
+  # 2. Load and subset density (5 arc-min resolution)
+  # ---------------------------------------------
+  density_5m <- rast("Lightning/WGLC/wglc_timeseries_05m.nc")
+  density_5m <- mask(crop(density_5m, brazil), brazil)
+  
+  # Subset to 2017-2021
+  dates <- seq.Date(from = as.Date("2010-01-01"), by = "month", length.out = nlyr(density_5m))
+  i_2017 <- which(dates == as.Date("2017-01-01"))
+  density_5m <- density_5m[[i_2017:nlyr(density_5m)]]
+  # Update dates to match the subset
+  dates <- dates[i_2017:length(dates)]
+  
+  # Scale by days in month
+  days <- days_in_month(dates)
+  for (i in 1:nlyr(density_5m)) {
+    density_5m[[i]] <- density_5m[[i]] * days[i]
+  }
+  
+  # Clean date-only names like "2017_01"
+  names(density_5m) <- format(dates, "%Y_%m")
+  
+  names(density_5m)
+  
+  # ---------------------------------------------
+  # 3. Load and subset stroke power rasters (30 arc-min)
+  # ---------------------------------------------
+  load_power_var <- function(varname) {
+    r_all <- rast("Lightning/WGLC/wglc_timeseries_30m.nc")
+    r <- subset(r_all, grep(varname, names(r_all), value = TRUE))
+    r <- mask(crop(r, brazil), brazil)
+    # Use the same date subsetting as density_5m
+    r <- r[[i_2017:nlyr(r)]]
+    names(r) <- format(dates, "%Y_%m")  # Use the same dates vector
+    return(r)
+  }
+  
+  power_mean   <- load_power_var("power_mean")
+  power_median <- load_power_var("power_median")
+  power_sd     <- load_power_var("power_SD")
+  
+  # ---------------------------------------------
+  # 4. Extract Mean Values by Region (GADM 1)
+  # ---------------------------------------------
+  extract_mean_df <- function(raster_obj, value_name) {
+    df <- terra::extract(raster_obj, roi_vect, fun = mean, na.rm = TRUE)
+    df$NAME_1 <- roi$NAME_1  
+    
+    df_long <- df %>%
+      pivot_longer(
+        cols = -c(ID, NAME_1),
+        names_to = "month_str",
+        values_to = value_name
+      ) %>%
+      mutate(
+        date = lubridate::ym(month_str)
+      ) %>%
+      select(NAME_1, date, all_of(value_name))
+    
+    return(df_long)
+  }
+  
+  
+  # Apply the function to each raster
+  density_df     <- extract_mean_df(density_5m, "density")
+  powermean_df   <- extract_mean_df(power_mean, "power_mean")
+  powermedian_df <- extract_mean_df(power_median, "power_median")
+  powersd_df     <- extract_mean_df(power_sd, "power_sd")
+  
+  # ---------------------------------------------
+  # 5. Combine into One Long Table
+  # ---------------------------------------------
+  all_lightning <- reduce(
+    list(density_df, powermean_df, powermedian_df, powersd_df),
+    ~ left_join(.x, .y, by = c("NAME_1", "date"))
+  )
+  
+  # ---------------------------------------------
+  # 6. Optional: Convert to sf and Add Geometry
+  # ---------------------------------------------
+  roi_df <- st_as_sf(roi)
+  lightning_sf <- left_join(roi_df, all_lightning, by = "NAME_1")
+  
+  
+  # Save results with compression
+  saveRDS(lightning_sf, lightning_sf_path, compress = "xz")
+  saveRDS(all_lightning, all_lightning_path, compress = "xz")
+  message("Saved processed data with compression")
+}
 
-# Prepare column names (region ID + 60 months from 2017–2021)
-dates <- seq.Date(from = as.Date("2017-01-01"), by = "month", length.out = nlyr(lightning))
-names(lightning_data) <- c("region", paste0("density", format(dates, "%Y_%m")))
+# ---------------------------------------------
+# 6. Quick Visualization for Jan 2017
+# ---------------------------------------------
+r_tmap <- lightning[[1]]
+names(r_tmap) <- "density2017_01"  # Optional rename for display
 
-# Combine lightning data back with the geometry
-lightning_sf <- cbind(roi_vect, lightning_data)
-lightning_sf <- st_as_sf(lightning_sf)  # convert to sf for plotting
+tm_shape(r_tmap) +
+  tm_raster(title = "Strokes/km²", style = "cont") +
+  tm_shape(brazil) +
+  tm_borders(col = "black")
 
-# Compute yearly mean for 2019
-lightning_sf$mean_2019 <- lightning_sf %>%
+# ---------------------------------------------
+# 7. NA Analysis 
+# ---------------------------------------------
+na_map <- is.na(lightning[[1]])
+plot(na_map, main = "NA regions in Jan 2017 (white = NA)")
+lines(brazil, col = "red")
+
+vals <- values(lightning[[1]])
+cat("Percent NA:", round(sum(is.na(vals)) / length(vals) * 100, 2), "%\n")
+
+
+summary(lightning_sf$date)
+
+
+########################################################################
+
+yearly_means <- lightning_sf %>%
   st_drop_geometry() %>%
-  select(starts_with("density2019_")) %>%
-  rowMeans(na.rm = TRUE)
+  mutate(year = year(date)) %>%
+  group_by(NAME_1, year) %>%
+  summarize(
+    mean_density = mean(density, na.rm = TRUE),
+    .groups = "drop"
+  )
 
-# Plot!
-tmap_mode("plot")  # or "view" for interactive mode
+mean_2019 <- yearly_means %>%
+  filter(year == 2019) %>%
+  select(NAME_1, mean_density)
 
-tm_shape(lightning_sf) +
-  tm_polygons("mean_2019", 
+# Join back to spatial data for plotting
+plot_data <- lightning_sf %>%
+  distinct(NAME_1, .keep_all = TRUE) %>%
+  left_join(mean_2019, by = "NAME_1")
+
+# Plot
+tmap_mode("plot")
+tm_shape(plot_data) +
+  tm_polygons("mean_density", 
               title = "Avg Lightning Density\n(2019, strokes/km²)") +
   tm_layout(frame = FALSE)
-
-
-lightning_sf$mean_2020 <- lightning_sf %>%
-  st_drop_geometry() %>%
-  select(starts_with("density2020_")) %>%
-  rowMeans(na.rm = TRUE)
-
-colnames(lightning_sf)
-
-
-# Plot!
-tmap_mode("plot")  # or "view" for interactive mode
-
-tm_shape(lightning_sf) +
-  tm_polygons("mean_2020", 
-              title = "Avg Lightning Density\n(2020, strokes/km²)") +
-  tm_layout(frame = FALSE)
-
-
-tm_shape(lightning_sf) +
-  tm_polygons("density2018_09", 
-              title = "Avg Lightning Density\n(2020, strokes/km²)") +
-  tm_layout(frame = FALSE)
-
-
-
