@@ -108,6 +108,7 @@ out24 %>%
 
 ############################################################
 
+
 # ---------------------------------------------
 # Check if final RDS file already exists
 # ---------------------------------------------
@@ -117,164 +118,84 @@ output_file <- file.path(output_path, "all_outages.rds")
 if (!file.exists(output_file)) {
   
   # ---------------------------------------------
-  # Load and Merge Individual CSVs
+  # Load, Clean, and Merge Individual CSVs
   # ---------------------------------------------
   file_paths <- list.files(file.path(output_path, "CSVs"), full.names = TRUE, pattern = "\\.csv$")
   
+  cause_labels <- c(
+    "Waived",                                      # 0
+    "Failure at consumer unit (no 3rd party impact)",  # 1
+    "Customer-side work only",                        # 2
+    "Emergency situation",                            # 3
+    "Suspension (default or safety)",                 # 4
+    "Rationing program",                              # 5
+    "Critical day event",                             # 6
+    "Load shedding (ONS)",                            # 7
+    "External to distribution system"                 # 8
+  )
+  
   out_list <- list()
   for (file in file_paths) {
-    year <- stringr::str_extract(file, "\\d{4}")
-    out_list[[paste0("out", year)]] <- read.csv(file, sep = ";")
+    year <- str_extract(file, "\\d{4}")
+    df <- read.csv(file, sep = ";")
+    
+    # Rename columns
+    colnames(df) <- c(
+      "data_generated",               # DatGeracaoConjuntoDados
+      "consumer_unit_group_id",      # IdeConjuntoUnidadeConsumidora
+      "consumer_unit_group_desc",    # DscConjuntoUnidadeConsumidora
+      "feeder_description",          # DscAlimentadorSubestacao
+      "substation_description",      # DscSubestacaoDistribuicao
+      "interruption_order_id",       # NumOrdemInterrupcao
+      "interruption_type",           # DscTipoInterrupcao
+      "interruption_reason_id",      # IdeMotivoInterrupcao
+      "interruption_start",          # DatInicioInterrupcao
+      "interruption_end",            # DatFimInterrupcao
+      "interruption_cause",          # DscFatoGeradorInterrupcao
+      "voltage_level",               # NumNivelTensao
+      "affected_units",              # NumUnidadeConsumidora
+      "group_consumer_count",        # NumConsumidorConjunto
+      "year",                        # NumAno
+      "regulated_agent_name",        # NomAgenteRegulado
+      "regulated_agent_abbr",        # SigAgente
+      "cpf_cnpj"                     # NumCPFCNPJ
+    )
+    
+    # Clean and transform
+    df <- df %>%
+      distinct() %>% # remove duplicates
+      mutate(
+        interruption_type = factor(
+          interruption_type,
+          levels = c("N\xe3o Programada", "Programada"),
+          labels = c("Unplanned", "Planned")
+        )
+      ) %>%
+      filter(interruption_type != "Planned") %>%
+      mutate(
+        interruption_cause = factor(
+          interruption_reason_id,
+          levels = 0:8,
+          labels = cause_labels
+        ),
+        interruption_start = fastPOSIXct(interruption_start),
+        interruption_end   = fastPOSIXct(interruption_end),
+        outage_duration_min = as.numeric(difftime(interruption_end, interruption_start, units = "mins")),
+        customer_outage_min = round(outage_duration_min * affected_units, 2),
+        outage_duration_min = round(outage_duration_min, 2)
+      )
+    
+    out_list[[paste0("out", year)]] <- df
   }
   
-  out_all <- dplyr::bind_rows(out_list, .id = "source")
-
-  
-  
-  # ---------------------------------------------
-  # Rename Columns 
-  # ---------------------------------------------
-  colnames(out_all) <- c(
-    "id",                           # ID from source df 
-    "data_generated",               # DatGeracaoConjuntoDados
-    "consumer_unit_group_id",      # IdeConjuntoUnidadeConsumidora
-    "consumer_unit_group_desc",    # DscConjuntoUnidadeConsumidora
-    "feeder_description",          # DscAlimentadorSubestacao
-    "substation_description",      # DscSubestacaoDistribuicao
-    "interruption_order_id",       # NumOrdemInterrupcao
-    "interruption_type",           # DscTipoInterrupcao
-    "interruption_reason_id",      # IdeMotivoInterrupcao
-    "interruption_start",          # DatInicioInterrupcao
-    "interruption_end",            # DatFimInterrupcao
-    "interruption_cause",          # DscFatoGeradorInterrupcao
-    "voltage_level",               # NumNivelTensao
-    "affected_units",              # NumUnidadeConsumidora
-    "group_consumer_count",        # NumConsumidorConjunto
-    "year",                        # NumAno
-    "regulated_agent_name",        # NomAgenteRegulado
-    "regulated_agent_abbr",        # SigAgente
-    "cpf_cnpj"                     # NumCPFCNPJ
-  )
-  
-
-  
-  # ---------------------------------------------
-  # Save the Combined Dataset
-  # ---------------------------------------------
+  out_all <- bind_rows(out_list, .id = "source")
   saveRDS(out_all, output_file)
-  cat("Merged dataset saved to:", output_file, "\n")
+  cat("Cleaned and merged dataset saved to:", output_file, "\n")
   
 } else {
-  cat("File already exists at:", output_file, "\nSkipping import and merge.\n")
+  cat("File already exists at:", output_file, "\nSkipping import and merge, loading in data.\n")
   outage <- readRDS(output_file)
 }
-
-
-# ---------------------------------------------
-# Remove duplicate observations
-# ---------------------------------------------
-outage <- outage %>% 
-  distinct()
-
-
-# ---------------------------------------------
-# Remove planned outages
-# ---------------------------------------------
-outage <- outage %>%
-  mutate(interruption_type = factor(
-    interruption_type,
-    levels = c("N\xe3o Programada", "Programada"),
-    labels = c("Unplanned", "Planned")
-  ))
-
-outage <- outage %>% 
-  filter(interruption_type != "Planned")
-
-# ---------------------------------------------
-# Rename interruption_cause to factor variable
-# using the interruption_reason_id (IdeMotivoInterrupcao)
-# ---------------------------------------------
-
-
-cause_labels <- c(
-  "Waived",                                      # 0
-  "Failure at consumer unit (no 3rd party impact)",  # 1
-  "Customer-side work only",                        # 2
-  "Emergency situation",                            # 3
-  "Suspension (default or safety)",                 # 4
-  "Rationing program",                              # 5
-  "Critical day event",                             # 6
-  "Load shedding (ONS)",                            # 7
-  "External to distribution system"                 # 8
-)
-
-outage <- outage %>%
-  mutate(
-    interruption_cause = factor(
-      interruption_reason_id,
-      levels = 0:8,
-      labels = cause_labels
-    )
-  )
-
-
-ggplot(outage, aes(x = interruption_cause, fill = interruption_cause)) + 
-  geom_bar() +
-  theme(axis.text.x = element_blank(),
-        axis.ticks.x = element_blank())
-
-
-# ---------------------------------------------
-# Calculate outage duration in hours
-# ---------------------------------------------
-
-# test (runtime was very long before using fasttime package)
-system.time({
- outtest <- outage[1:10000, ] %>%
-    mutate(
-      start = fastPOSIXct(interruption_start),
-      end = fastPOSIXct(interruption_end),
-      duration = as.numeric(difftime(end, start, units = "mins"))
-    )
-})
-
-system.time({
-outage <- outage %>%
-  mutate(
-    interruption_start = fastPOSIXct(interruption_start),
-    interruption_end   = fastPOSIXct(interruption_end),
-    outage_duration_min = as.numeric(difftime(interruption_end, interruption_start, units = "mins"))
-  )
-})
-
-
-# ---------------------------------------------
-# Calculate customer-outage minutes
-# ---------------------------------------------
-outage <- outage %>%
-  mutate(customer_outage_min = outage_duration_min * affected_units)
-
-outage <- outage %>%
-  mutate(
-    customer_outage_min = round(customer_outage_min, 2),
-    outage_duration_min = round(outage_duration_min, 2)
-  )
-
-
-
-
-# ---------------------------------------------
-# will aggregate later when i have a sf for the consumer id 
-# outage <- outage %>%
-#   mutate(month = floor_date(interruption_start, "month")) %>%
-#   group_by(region, month) %>%
-#   summarise(
-#     avg_customer_outage_hr = mean(customer_outage_hr, na.rm = TRUE),
-#     total_customer_outage_hr = sum(customer_outage_hr, na.rm = TRUE),
-#     .groups = "drop"
-#   )
-
-saveRDS(outage, file = "ANEEL/all_outages.rds")
 
 
 #################################################
@@ -485,50 +406,6 @@ cat("Percent NA:", round(sum(is.na(vals)) / length(vals) * 100, 2), "%\n")
 
 summary(lightning_sf$date)
 
-
-
-# Initialize directories
-lightout_dir <- "Lightning/Masked"  # Fixed typo
-raster_dir <- "Lightning/Rasters"
-dir.create(lightout_dir, showWarnings = FALSE, recursive = TRUE)
-dir.create(raster_dir, showWarnings = FALSE, recursive = TRUE)
-
-# File paths
-lightning_sf_path <- file.path(lightout_dir, "lightning_sf.rds")
-all_lightning_path <- file.path(lightout_dir, "all_lightning.rds")
-
-# Check if processing is needed
-needs_processing <- !all(file.exists(c(lightning_sf_path, all_lightning_path,
-                                     file.path(raster_dir, "density_5m.tif")))
-
-if (!needs_processing) {
-  tryCatch({
-    lightning_sf <- readRDS(lightning_sf_path)
-    all_lightning <- readRDS(all_lightning_path)
-    message("Successfully loaded pre-processed data")
-  }, error = function(e) {
-    message("Error loading saved files: ", e$message)
-    needs_processing <<- TRUE
-  })
-}
-
-if (needs_processing) {
-  message("Processing data...")
-  
-  # [Your full processing code here]
-  
-  # Save results
-  saveRDS(lightning_sf, lightning_sf_path, compress = "xz")
-  saveRDS(all_lightning, all_lightning_path, compress = "xz")
-  
-  # Save rasters (force overwrite)
-  writeRaster(density_5m, file.path(raster_dir, "density_5m.tif"), overwrite = TRUE)
-  writeRaster(power_mean, file.path(raster_dir, "power_mean.tif"), overwrite = TRUE)
-  writeRaster(power_median, file.path(raster_dir, "power_median.tif"), overwrite = TRUE)
-  writeRaster(power_sd, file.path(raster_dir, "power_sd.tif"), overwrite = TRUE)
-  
-  message("Data processing complete and saved")
-}
 
 ########################################################################
 
