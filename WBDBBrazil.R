@@ -2,37 +2,34 @@ rm(list = ls())
 
 setwd("~/Outages")
 
-library(blackmarbler)
-library(DT)
-library(dplyr)
-library(exactextractr)
-library(fixest)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(units)
+library(stringr)
+library(sf)
+library(terra)
+library(tidyterra)
 library(geodata)
+library(exactextractr)
+library(blackmarbler)
+library(MODIStsp)
 library(ggplot2)
 library(ggpubr)
-library(gtools)
-library(janitor)
-library(kableExtra)
+library(tmap)
 library(leaflet)
 library(leaflet.providers)
-library(lubridate)
 library(ncdf4)
-library(readxl)
 library(rhdf5)
-library(sf)
-library(tidyterra)
-library(tidyverse)
-library(tmap)
-library(units)
-library(WDI)
-library(stringr)
-library(MODIStsp)
-library(httr)
-library(tidyverse)
 library(readxl)
-library(terra)
-
-
+library(DT)
+library(kableExtra)
+library(gtools)
+library(fixest)
+library(WDI)
+library(httr)
+library(fasttime)
+options(scipen=999)
 
 
 wb <- read_excel("~/Outages/WBDB/WB-DB.xlsx")
@@ -111,31 +108,34 @@ out24 %>%
 
 ############################################################
 
-
 # ---------------------------------------------
 # Check if final RDS file already exists
 # ---------------------------------------------
 output_path <- "~/Outages/ANEEL"
+output_file <- file.path(output_path, "all_outages.rds")
 
-if (!file.exists(output_path)) {
+if (!file.exists(output_file)) {
   
   # ---------------------------------------------
-  # 1. Load and Merge Individual CSVs
+  # Load and Merge Individual CSVs
   # ---------------------------------------------
-  file_paths <- list.files("~/Outages/ANEEL/CSVs", full.names = TRUE, pattern = "\\.csv$")
+  file_paths <- list.files(file.path(output_path, "CSVs"), full.names = TRUE, pattern = "\\.csv$")
   
   out_list <- list()
   for (file in file_paths) {
-    year <- str_extract(file, "\\d{4}")
+    year <- stringr::str_extract(file, "\\d{4}")
     out_list[[paste0("out", year)]] <- read.csv(file, sep = ";")
   }
   
-  out_all <- bind_rows(out_list, .id = "source")
+  out_all <- dplyr::bind_rows(out_list, .id = "source")
+
+  
   
   # ---------------------------------------------
-  # 2. Rename Columns for Clarity
+  # Rename Columns 
   # ---------------------------------------------
   colnames(out_all) <- c(
+    "id",                           # ID from source df 
     "data_generated",               # DatGeracaoConjuntoDados
     "consumer_unit_group_id",      # IdeConjuntoUnidadeConsumidora
     "consumer_unit_group_desc",    # DscConjuntoUnidadeConsumidora
@@ -156,15 +156,125 @@ if (!file.exists(output_path)) {
     "cpf_cnpj"                     # NumCPFCNPJ
   )
   
+
+  
   # ---------------------------------------------
-  # 3. Save the Combined Dataset
+  # Save the Combined Dataset
   # ---------------------------------------------
-  saveRDS(out_all, output_path)
-  cat("Merged dataset saved to:", output_path, "\n")
+  saveRDS(out_all, output_file)
+  cat("Merged dataset saved to:", output_file, "\n")
   
 } else {
-  cat("File already exists at:", output_path, "\nSkipping import and merge.\n")
+  cat("File already exists at:", output_file, "\nSkipping import and merge.\n")
+  outage <- readRDS(output_file)
 }
+
+
+# ---------------------------------------------
+# Remove duplicate observations
+# ---------------------------------------------
+outage <- outage %>% 
+  distinct()
+
+
+# ---------------------------------------------
+# Remove planned outages
+# ---------------------------------------------
+outage <- outage %>%
+  mutate(interruption_type = factor(
+    interruption_type,
+    levels = c("N\xe3o Programada", "Programada"),
+    labels = c("Unplanned", "Planned")
+  ))
+
+outage <- outage %>% 
+  filter(interruption_type != "Planned")
+
+# ---------------------------------------------
+# Rename interruption_cause to factor variable
+# using the interruption_reason_id (IdeMotivoInterrupcao)
+# ---------------------------------------------
+
+
+cause_labels <- c(
+  "Waived",                                      # 0
+  "Failure at consumer unit (no 3rd party impact)",  # 1
+  "Customer-side work only",                        # 2
+  "Emergency situation",                            # 3
+  "Suspension (default or safety)",                 # 4
+  "Rationing program",                              # 5
+  "Critical day event",                             # 6
+  "Load shedding (ONS)",                            # 7
+  "External to distribution system"                 # 8
+)
+
+outage <- outage %>%
+  mutate(
+    interruption_cause = factor(
+      interruption_reason_id,
+      levels = 0:8,
+      labels = cause_labels
+    )
+  )
+
+
+ggplot(outage, aes(x = interruption_cause, fill = interruption_cause)) + 
+  geom_bar() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+
+# ---------------------------------------------
+# Calculate outage duration in hours
+# ---------------------------------------------
+
+# test (runtime was very long before using fasttime package)
+system.time({
+ outtest <- outage[1:10000, ] %>%
+    mutate(
+      start = fastPOSIXct(interruption_start),
+      end = fastPOSIXct(interruption_end),
+      duration = as.numeric(difftime(end, start, units = "mins"))
+    )
+})
+
+system.time({
+outage <- outage %>%
+  mutate(
+    interruption_start = fastPOSIXct(interruption_start),
+    interruption_end   = fastPOSIXct(interruption_end),
+    outage_duration_min = as.numeric(difftime(interruption_end, interruption_start, units = "mins"))
+  )
+})
+
+
+# ---------------------------------------------
+# Calculate customer-outage minutes
+# ---------------------------------------------
+outage <- outage %>%
+  mutate(customer_outage_min = outage_duration_min * affected_units)
+
+outage <- outage %>%
+  mutate(
+    customer_outage_min = round(customer_outage_min, 2),
+    outage_duration_min = round(outage_duration_min, 2)
+  )
+
+
+
+
+# ---------------------------------------------
+# will aggregate later when i have a sf for the consumer id 
+# outage <- outage %>%
+#   mutate(month = floor_date(interruption_start, "month")) %>%
+#   group_by(region, month) %>%
+#   summarise(
+#     avg_customer_outage_hr = mean(customer_outage_hr, na.rm = TRUE),
+#     total_customer_outage_hr = sum(customer_outage_hr, na.rm = TRUE),
+#     .groups = "drop"
+#   )
+
+saveRDS(outage, file = "ANEEL/all_outages.rds")
 
 
 #################################################
