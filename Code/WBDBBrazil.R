@@ -1,5 +1,3 @@
-rm(list = ls())
-
 
 library(tidyverse)
 library(janitor)
@@ -70,8 +68,8 @@ ggplot(brwb, aes(x = year)) +
 # Trial w small df
 
 out24 <- read_delim(here("ANEEL", "CSVs", "interrupcoes-energia-eletrica-2024.csv"), 
-                  delim = ";", 
-                  locale = locale(encoding = "ISO-8859-1"))
+                    delim = ";", 
+                    locale = locale(encoding = "ISO-8859-1"))
 
 
 colnames(out24) <- c(
@@ -140,8 +138,8 @@ if (!file.exists(output_file)) {
     year <- str_extract(file, "\\d{4}")
     
     df <- read_delim(file, 
-                        delim = ";", 
-                        locale = locale(encoding = "ISO-8859-1"))
+                     delim = ";", 
+                     locale = locale(encoding = "ISO-8859-1"))
     
     # Rename columns
     colnames(df) <- c(
@@ -458,3 +456,4 @@ tm_shape(plot_data) +
   tm_polygons("mean_density", 
               title = "Avg Lightning Density\n(2019, strokes/km²)") +
   tm_layout(frame = FALSE)
+
