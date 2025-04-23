@@ -1,8 +1,0 @@
-*.rds
-*.csv
-*.tif
-*.nc
-*.RData*
-ANEEL/
-GADM/
-WGLC/

@@ -9,8 +9,13 @@
 
 # Ignore folders that store data
 ANEEL/
+Lightning/
 GADM/
-WGLC/
+WBDB/
+CSVNew/
+CSV/
+Outputs/
+Downloads/
 
 # RStudio-related
 .Rproj.user/
