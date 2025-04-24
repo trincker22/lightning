@@ -1,6 +1,3 @@
-rm(list = ls())
-
-
 library(tidyverse)
 library(janitor)
 library(lubridate)
@@ -28,6 +25,7 @@ library(fixest)
 library(WDI)
 library(httr)
 library(fasttime)
+library(here)
 options(scipen=999)
 
 
