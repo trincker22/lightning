@@ -219,6 +219,7 @@ loc <- loc %>%
 
 
 
+
 #################################################
 
 iso3_code <- "BRA"
@@ -456,3 +457,217 @@ tm_shape(plot_data) +
   tm_polygons("mean_density", 
               title = "Avg Lightning Density\n(2019, strokes/km²)") +
   tm_layout(frame = FALSE)
+
+
+#####################################################
+
+# GADM(2) Lightning Aggregation 
+
+lightout_dir_gadm2 <- here("Lightning", "Masked_GADM2")
+raster_dir_gadm2 <- here("Lightning", "Rasters_GADM2")
+dir.create(lightout_dir_gadm2, showWarnings = FALSE, recursive = TRUE)
+dir.create(raster_dir_gadm2, showWarnings = FALSE, recursive = TRUE)
+
+# New file paths for GADM(2)
+lightning_sf_path_gadm2 <- file.path(lightout_dir_gadm2, "lightning_sf_gadm2.rds")
+all_lightning_path_gadm2 <- file.path(lightout_dir_gadm2, "all_lightning_gadm2.rds")
+
+# Check if processing is needed
+needs_processing_gadm2 <- !all(file.exists(c(
+  lightning_sf_path_gadm2,
+  all_lightning_path_gadm2,
+  file.path(raster_dir_gadm2, "density_5m.tif"),
+  file.path(raster_dir_gadm2, "power_mean.tif"),
+  file.path(raster_dir_gadm2, "power_median.tif"), 
+  file.path(raster_dir_gadm2, "power_sd.tif")
+)))
+
+if (!needs_processing_gadm2) {
+  tryCatch({
+    lightning_sf <- readRDS(lightning_sf_path_gadm2)
+    all_lightning <- readRDS(all_lightning_path_gadm2)
+    density_5m <- rast(file.path(raster_dir_gadm2, "density_5m.tif"))
+    power_mean <- rast(file.path(raster_dir_gadm2, "power_mean.tif"))
+    power_median <- rast(file.path(raster_dir_gadm2, "power_median.tif"))
+    power_sd <- rast(file.path(raster_dir_gadm2, "power_sd.tif"))
+    message("Successfully loaded all GADM(2) processed data")
+  }, error = function(e) {
+    message("Error loading saved GADM(2) files: ", e$message)
+    needs_processing_gadm2 <<- TRUE
+  })
+}
+
+if (needs_processing_gadm2) {
+  message("Processing GADM(2) data...")
+  
+  # 1. Load GADM level 2 (municipalities)
+  brazil <- load_gadm(0) %>% st_transform(crs = 4326)
+  roi <- load_gadm(2)
+  roi_vect <- vect(roi) %>% project("EPSG:4326")
+  
+  # 2. Load and subset density (5 arc-min)
+  density_5m <- rast(here("Lightning", "WGLC", "wglc_timeseries_05m.nc"))
+  density_5m <- mask(crop(density_5m, brazil), brazil)
+  
+  dates <- seq.Date(from = as.Date("2010-01-01"), by = "month", length.out = nlyr(density_5m))
+  i_2017 <- which(dates == as.Date("2017-01-01"))
+  density_5m <- density_5m[[i_2017:nlyr(density_5m)]]
+  dates <- dates[i_2017:length(dates)]
+  
+  # Scale by days in month
+  days <- days_in_month(dates)
+  for (i in 1:nlyr(density_5m)) {
+    density_5m[[i]] <- density_5m[[i]] * days[i]
+  }
+  
+  names(density_5m) <- format(dates, "%Y_%m")
+  
+  # 3. Load and subset stroke power rasters (30 arc-min)
+  load_power_var <- function(varname) {
+    r_all <- rast(here("Lightning", "WGLC", "wglc_timeseries_30m.nc"))
+    r <- subset(r_all, grep(varname, names(r_all), value = TRUE))
+    r <- mask(crop(r, brazil), brazil)
+    r <- r[[i_2017:nlyr(r)]]
+    names(r) <- format(dates, "%Y_%m")
+    return(r)
+  }
+  
+  power_mean   <- load_power_var("power_mean")
+  power_median <- load_power_var("power_median")
+  power_sd     <- load_power_var("power_SD")
+  
+  # 4. Extract Mean Values by Municipality (GADM 2)
+  extract_mean_df <- function(raster_obj, value_name) {
+    df <- terra::extract(raster_obj, roi_vect, fun = mean, na.rm = TRUE)
+    df$NAME_2 <- roi$NAME_2
+    
+    df_long <- df %>%
+      pivot_longer(
+        cols = -c(ID, NAME_2),
+        names_to = "month_str",
+        values_to = value_name
+      ) %>%
+      mutate(
+        date = lubridate::ym(month_str)
+      ) %>%
+      select(NAME_2, date, all_of(value_name))
+    
+    return(df_long)
+  }
+  
+  # Apply the function to each raster
+  density_df     <- extract_mean_df(density_5m, "density")
+  powermean_df   <- extract_mean_df(power_mean, "power_mean")
+  powermedian_df <- extract_mean_df(power_median, "power_median")
+  powersd_df     <- extract_mean_df(power_sd, "power_sd")
+  
+  # 5. Combine into One Long Table
+  all_lightning <- reduce(
+    list(density_df, powermean_df, powermedian_df, powersd_df),
+    ~ left_join(.x, .y, by = c("NAME_2", "date"))
+  )
+  
+  # 6. Convert to sf and Add Geometry
+  roi_df <- st_as_sf(roi)
+  lightning_sf <- left_join(roi_df, all_lightning, by = "NAME_2")
+  
+  # Save results into new folders
+  saveRDS(lightning_sf, lightning_sf_path_gadm2, compress = "xz")
+  saveRDS(all_lightning, all_lightning_path_gadm2, compress = "xz")
+  
+  writeRaster(density_5m, file.path(raster_dir_gadm2, "density_5m.tif"), overwrite = TRUE)
+  writeRaster(power_mean, file.path(raster_dir_gadm2, "power_mean.tif"), overwrite = TRUE)
+  writeRaster(power_median, file.path(raster_dir_gadm2, "power_median.tif"), overwrite = TRUE)
+  writeRaster(power_sd, file.path(raster_dir_gadm2, "power_sd.tif"), overwrite = TRUE)
+  
+  message("GADM(2) data processing complete and saved")
+}
+
+####################################################
+
+
+plot_lightning_municipality <- function(lightning_data, municipality_name) {
+  
+  # Filter to the municipality 
+  muni_data <- lightning_data %>%
+    st_drop_geometry() %>%  # Drop the spatial part 
+    filter(NAME_2 == municipality_name) %>%
+    select(NAME_2, date, density, power_mean, power_median, power_sd)
+  
+  if (nrow(muni_data) == 0) {
+    message("Municipality not found. Double-check the spelling.")
+    return(NULL)
+  }
+  
+  # Reshape for easier plotting
+  muni_long <- muni_data %>%
+    pivot_longer(
+      cols = c(density, power_mean, power_median, power_sd),
+      names_to = "variable",
+      values_to = "value"
+    )
+  
+  # Plot
+  ggplot(muni_long, aes(x = date, y = value, color = variable)) +
+    geom_line(size = 1) +
+    labs(
+      title = paste("Lightning Indicators Over Time -", municipality_name),
+      x = "Date",
+      y = "Value",
+      color = "Variable"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+}
+
+
+lightning_sf_gadm2 <- readRDS(here("Lightning", "Masked_GADM2", "lightning_sf_gadm2.rds"))
+
+plot_lightning_municipality(lightning_sf_gadm2, "São Paulo")
+
+plot_lightning_municipality(lightning_sf_gadm2, "Campinas")
+
+# (Find municipality names inside `NAME_2` column of the data.)
+
+####################################################
+
+plot_lightning_map <- function(lightning_data, month_choice) {
+  
+  # Check if the date exists
+  available_dates <- unique(lightning_data$date)
+  if (!month_choice %in% available_dates) {
+    message("Month not found. Available dates are:")
+    print(available_dates)
+    return(NULL)
+  }
+  
+  map_data <- lightning_data %>%
+    filter(date == month_choice)
+  
+  # Basic plot
+  ggplot(map_data) +
+    geom_sf(aes(fill = density), color = NA) +
+    scale_fill_viridis_c(option = "plasma", name = "Lightning Density", na.value = "grey80") +
+    labs(
+      title = paste("Lightning Density by Municipality -", format(month_choice, "%B %Y")),
+      caption = "Data: WWLLN + GADM2",
+      fill = "Density"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right"
+    )
+}
+# Load GADM(2) lightning data
+lightning_sf_gadm2 <- readRDS(here("Lightning", "Masked_GADM2", "lightning_sf_gadm2.rds"))
+
+# January 2018
+plot_lightning_map(lightning_sf_gadm2, as.Date("2018-01-01"))
+
+# July 2020
+plot_lightning_map(lightning_sf_gadm2, as.Date("2020-07-01"))
+
+
