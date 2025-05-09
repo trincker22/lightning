@@ -219,8 +219,78 @@ loc <- loc %>%
 
 
 
+##################################
+# _pj files 
 
-#################################################
+# Set cleaned output file path
+cleaned_path <- here("ANEEL", "PointKey", "Cleaned", "consumer_conj_centroids.rds")
+
+# If cleaned file exists, load it
+if (file.exists(cleaned_path)) {
+  message("Loading preprocessed CONJ centroids from RDS file")
+  consumer_conj_centroids <- readRDS(cleaned_path)
+  
+} else {
+  message("Preprocessed file not found. Reading raw PJ files and processing.")
+  
+  # Read all *_PJ.csv files from PointKey
+  pointcsv <- list.files(here("ANEEL", "PointKey", "Raw"), pattern = "_pj.csv", full.names = TRUE)
+  consumer_list <- list()
+  
+  for (file_path in pointcsv) {
+    # Clean name for reference
+    obj_name <- str_remove(basename(file_path), "_pj.csv")
+    
+    # Read and keep spatial columns
+    df <- read_delim(file_path, delim = ";", locale = locale(encoding = "ISO-8859-1")) %>%
+      select(CONJ, POINT_X, POINT_Y)
+    
+    consumer_list[[obj_name]] <- df
+  }
+  
+  # Combine all PJ consumer points
+  consumer_points <- bind_rows(consumer_list)
+  
+  # Convert to sf
+  consumer_sf <- st_as_sf(consumer_points, coords = c("POINT_X", "POINT_Y"), crs = 4326)
+  
+  # Aggregate to centroid per CONJ
+  consumer_conj_centroids <- consumer_sf %>%
+    group_by(CONJ) %>%
+    summarise(geometry = st_centroid(st_union(geometry)), .groups = "drop")
+  
+  # Save for future use
+  saveRDS(consumer_conj_centroids, cleaned_path)
+  message("Saved processed CONJ centroids to: ", cleaned_path)
+}
+
+# Join with outage data 
+
+# Ensure both keys are numeric 
+out24 <- out24 %>%
+  mutate(consumer_unit_group_id = as.numeric(consumer_unit_group_id))
+
+consumer_conj_centroids <- consumer_conj_centroids %>%
+  mutate(CONJ = as.numeric(CONJ))
+
+# Join and convert to sf
+out24_geo <- out24 %>%
+  left_join(consumer_conj_centroids, by = c("consumer_unit_group_id" = "CONJ")) %>%
+  st_as_sf(crs = 4326)
+
+# --- Diagnostics ---
+cat("Empty geometries after join:", sum(st_is_empty(out24_geo$geometry)), "\n")
+cat("Total outage rows:", nrow(out24), "\n")
+cat("Unique outage CONJs:", length(unique(out24$consumer_unit_group_id)), "\n")
+cat("Unique geometry CONJs:", length(unique(consumer_conj_centroids$CONJ)), "\n")
+cat("Matched CONJs:", sum(out24$consumer_unit_group_id %in% consumer_conj_centroids$CONJ), "\n")
+cat("Unmatched outage rows:", nrow(out24) - sum(out24$consumer_unit_group_id %in% consumer_conj_centroids$CONJ), "\n")
+
+plot(consumer_conj_centroids)
+
+
+##########################################
+
 
 iso3_code <- "BRA"
 gadm_dir <- here("GADM")
