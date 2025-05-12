@@ -26,6 +26,8 @@ library(WDI)
 library(httr)
 library(fasttime)
 library(here)
+library(geobr)
+library(rmapshaper)
 options(scipen=999)
 
 
@@ -218,10 +220,8 @@ loc <- loc %>%
   )
 
 
-
 ##################################
 # _pj files 
-
 # Set cleaned output file path
 cleaned_path <- here("ANEEL", "PointKey", "Cleaned", "consumer_conj_centroids.rds")
 
@@ -233,25 +233,22 @@ if (file.exists(cleaned_path)) {
 } else {
   message("Preprocessed file not found. Reading raw PJ files and processing.")
   
-  # Read all *_PJ.csv files from PointKey
+  # Read all *_PJ.csv files 
   pointcsv <- list.files(here("ANEEL", "PointKey", "Raw"), pattern = "_pj.csv", full.names = TRUE)
   consumer_list <- list()
   
   for (file_path in pointcsv) {
-    # Clean name for reference
+
     obj_name <- str_remove(basename(file_path), "_pj.csv")
     
-    # Read and keep spatial columns
     df <- read_delim(file_path, delim = ";", locale = locale(encoding = "ISO-8859-1")) %>%
       select(CONJ, POINT_X, POINT_Y)
     
     consumer_list[[obj_name]] <- df
   }
   
-  # Combine all PJ consumer points
   consumer_points <- bind_rows(consumer_list)
-  
-  # Convert to sf
+
   consumer_sf <- st_as_sf(consumer_points, coords = c("POINT_X", "POINT_Y"), crs = 4326)
   
   # Aggregate to centroid per CONJ
@@ -259,19 +256,23 @@ if (file.exists(cleaned_path)) {
     group_by(CONJ) %>%
     summarise(geometry = st_centroid(st_union(geometry)), .groups = "drop")
   
-  # Save for future use
+  # save
   saveRDS(consumer_conj_centroids, cleaned_path)
   message("Saved processed CONJ centroids to: ", cleaned_path)
 }
 
+consumer_conj_centroids <-  consumer_conj_centroids %>% 
+  left_join(conj_region_check, join_by(CONJ == consumer_unit_group_id))
+   
 # Join with outage data 
 
-# Ensure both keys are numeric 
-out24 <- out24 %>%
-  mutate(consumer_unit_group_id = as.numeric(consumer_unit_group_id))
+# # Ensure both keys are numeric 
+# out24 <- out24 %>%
+#   mutate(consumer_unit_group_id = as.numeric(consumer_unit_group_id))
+# 
+# consumer_conj_centroids <- consumer_conj_centroids %>%
+#   mutate(CONJ = as.numeric(CONJ))
 
-consumer_conj_centroids <- consumer_conj_centroids %>%
-  mutate(CONJ = as.numeric(CONJ))
 
 # Join and convert to sf
 out24_geo <- out24 %>%
@@ -288,9 +289,132 @@ cat("Unmatched outage rows:", nrow(out24) - sum(out24$consumer_unit_group_id %in
 
 plot(consumer_conj_centroids)
 
-
 ##########################################
 
+# creating key. CONJ code -> intermediate region
+
+conj_int_path <- here("ANEEL", "IntermediateKey", "conj_int.rds")
+
+muni_meso_lookup <- lookup_muni(name_muni = "all")
+
+# Download all intermediate regions for Brazil and standardize to EPSG:4326
+intermediate_regions <- read_intermediate_region(year = 2020) %>%
+  st_transform(4326)
+
+if (file.exists(conj_int_path)) {
+  message("Loading CONJ to intermediate region key")
+  conj_int <- readRDS(conj_int_path)
+  
+} else {
+  message("Generating key")
+  
+  int_key <- muni_meso_lookup %>%
+    select(code_muni, name_muni, code_intermediate, name_intermediate, abbrev_state) %>%
+    left_join(
+      intermediate_regions %>% select(code_intermediate, geom),
+      by = "code_intermediate"
+    )
+  int_key <- st_as_sf(int_key, crs = 4326)
+  ##plotting
+  int_ba <- int_key %>% filter(abbrev_state == "BA" | 
+                                 abbrev_state == "MG"|
+                                 abbrev_state == "ES")
+  
+  int_key_simple <- ms_simplify(int_ba, keep = 0.05)
+  
+  ggplot(int_key_simple) +
+    geom_sf(aes(fill = name_intermediate), color = NA) +
+    guides(fill = "none") +
+    theme_minimal()
+  
+  # int_key maps CONJ to int code 
+  int_key <- int_key %>% 
+    left_join(loc, join_by(code_muni == municipality_code)) %>%
+    st_drop_geometry()  # drop geometry early for speed
+  
+  # remove duplicates from int_key to get int_sim 
+  int_sim <- int_key %>% 
+    select(consumer_unit_group_id, code_intermediate) %>%
+    distinct(consumer_unit_group_id, code_intermediate, .keep_all = TRUE)
+  
+  ##########################################
+  # handling conj codes assigned to multiple int regions 
+  
+  conj_region_check <- int_sim %>%
+    group_by(consumer_unit_group_id) %>%
+    summarise(n_intermediates = n_distinct(code_intermediate)) %>%
+    filter(n_intermediates > 1)
+  
+  conjdup <- conj_region_check %>% 
+    pull(consumer_unit_group_id)
+  
+  # CASE 1: assign CONJs with only one region directly
+  conj_unique_assigned <- int_sim %>%
+    group_by(consumer_unit_group_id) %>%
+    filter(n() == 1) %>%
+    ungroup() %>%
+    mutate(method = "unique_mapping", tie_flag = 0L)
+  
+  # CASE 2: Resolve multi-region CONJs via _PJ geometry 
+  pj_mapped <- consumer_conj_centroids %>%
+    filter(CONJ %in% conjdup) %>%
+    st_transform(4326) %>%
+    st_join(intermediate_regions %>% select(code_intermediate)) %>%
+    select(consumer_unit_group_id = CONJ, code_intermediate) %>%
+    mutate(method = "point_geometry", tie_flag = 1L)
+  
+  # CASE 3: For the remaining ambiguous CONJs not covered by _PJ, use majority/random
+  remaining_conjs <- setdiff(conjdup, pj_mapped$consumer_unit_group_id)
+  
+  majority_raw <- int_sim %>%
+    filter(consumer_unit_group_id %in% remaining_conjs) %>%
+    count(consumer_unit_group_id, code_intermediate)
+  
+  conj_tie_check <- majority_raw %>%
+    group_by(consumer_unit_group_id) %>%
+    filter(n == max(n)) %>%
+    mutate(is_tie = n() > 1)
+  
+  set.seed(42)
+  majority_assigned <- conj_tie_check %>%
+    group_by(consumer_unit_group_id) %>%
+    slice_sample(n = 1) %>%
+    ungroup() %>%
+    mutate(
+      method = "majority_rule_or_random",
+      tie_flag = as.integer(is_tie)
+    ) %>%
+    select(-is_tie)
+  
+# rbind
+  conj_int <- bind_rows(
+    conj_unique_assigned,
+    pj_mapped,
+    majority_assigned
+  ) %>%
+    distinct(consumer_unit_group_id, .keep_all = TRUE)
+  
+  # save
+  saveRDS(conj_int, conj_int_path)
+  message("Saved CONJ → intermediate region mapping to ", conj_int_path)
+}
+
+nrow(conj_int)==length(unique(int_sim$consumer_unit_group_id)) # works
+
+
+conj_int <- conj_int %>% 
+  select(-c(geometry, n)) %>%  # drop stale geometry
+  left_join(
+    intermediate_regions %>% select(code_intermediate, geometry = geom),
+    by = "code_intermediate"
+  ) %>%
+  st_as_sf(crs = 4326)  
+
+  out24 <- out24 %>%
+    left_join(conj_int, by = "consumer_unit_group_id")
+  
+
+######################################################
 
 iso3_code <- "BRA"
 gadm_dir <- here("GADM")
