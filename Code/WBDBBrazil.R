@@ -1,6 +1,7 @@
 library(tidyverse)
 library(janitor)
 library(lubridate)
+library(arrow)
 library(units)
 library(stringr)
 library(sf)
@@ -109,20 +110,18 @@ out24 %>%
 
 ############################################################
 
-# Changed encoding to read accents properly 
-# ---------------------------------------------
-# Check if final RDS file already exists
-# ---------------------------------------------
+# Define output path and file name
 output_path <- here("ANEEL")
-output_file <- file.path(output_path, "all_outages.rds")
+output_file <- file.path(output_path, "out_all.rds")
 
 if (!file.exists(output_file)) {
   
-  # ---------------------------------------------
-  # Load, Clean, and Merge Individual CSVs
-  # ---------------------------------------------
+  message("Generating full outage dataset from raw CSVs")
+  
+  # List of all CSVs to load
   file_paths <- list.files(here("ANEEL", "CSVs"), full.names = TRUE, pattern = "\\.csv$")
   
+  # Labels for interruption causes
   cause_labels <- c(
     "Waived",                                      # 0
     "Failure at consumer unit (no 3rd party impact)",  # 1
@@ -136,12 +135,13 @@ if (!file.exists(output_file)) {
   )
   
   out_list <- list()
+  
   for (file in file_paths) {
     year <- str_extract(file, "\\d{4}")
     
-    df <- read_delim(file, 
-                        delim = ";", 
-                        locale = locale(encoding = "ISO-8859-1"))
+    df <- read_delim(file,
+                     delim = ";",
+                     locale = locale(encoding = "ISO-8859-1"))
     
     # Rename columns
     colnames(df) <- c(
@@ -165,9 +165,9 @@ if (!file.exists(output_file)) {
       "cpf_cnpj"                     # NumCPFCNPJ
     )
     
-    # Clean and transform
+    # Clean and process
     df <- df %>%
-      distinct() %>% # remove duplicates
+      distinct() %>%
       mutate(
         interruption_type = factor(
           interruption_type,
@@ -192,18 +192,25 @@ if (!file.exists(output_file)) {
     out_list[[paste0("out", year)]] <- df
   }
   
+  # Bind all years into one dataframe
   out_all <- bind_rows(out_list, .id = "source")
+  
+  # Save to RDS for future use
   saveRDS(out_all, output_file)
   cat("Cleaned and merged dataset saved to:", output_file, "\n")
   
 } else {
-  cat("File already exists at:", output_file, "\nSkipping import and merge, loading in data.\n")
-  outage <- readRDS(output_file)
+  cat("File already exists at:", output_file, "\nLoading from disk.\n")
+  out_all <- readRDS(output_file)
 }
 
+##########################################
+# Loads the CONJ-to-municipality lookup table from ANEEL.
+# Renames columns to English for clarity/ compatibility
+# This has a m:m join with the CONJ codes, so it is used as a middle step
+# to map to the intermediate region
+##########################################
 
-#################################################
-# location key 
 loc <- read_delim(
   here("ANEEL", "LocationKey", "indqual-municipio.csv"), 
   delim = ";", 
@@ -219,143 +226,101 @@ loc <- loc %>%
     state_abbr = SigUF
   )
 
+##########################################
+# Loads or builds spatial centroid coordinates for each CONJ (consumer unit group)
+# using preprocessed RDS or raw *_pj.csv point files from ANEEL.
+# The _pj files do not include all CONJ codes, just those that primarily serve businesses
+# This chunk takes a while to load, one of the csvs is 4GB
+##########################################
 
-##################################
-# _pj files 
-# Set cleaned output file path
 cleaned_path <- here("ANEEL", "PointKey", "Cleaned", "consumer_conj_centroids.rds")
 
-# If cleaned file exists, load it
 if (file.exists(cleaned_path)) {
   message("Loading preprocessed CONJ centroids from RDS file")
   consumer_conj_centroids <- readRDS(cleaned_path)
-  
 } else {
   message("Preprocessed file not found. Reading raw PJ files and processing.")
   
-  # Read all *_PJ.csv files 
   pointcsv <- list.files(here("ANEEL", "PointKey", "Raw"), pattern = "_pj.csv", full.names = TRUE)
   consumer_list <- list()
   
   for (file_path in pointcsv) {
-
-    obj_name <- str_remove(basename(file_path), "_pj.csv")
-    
     df <- read_delim(file_path, delim = ";", locale = locale(encoding = "ISO-8859-1")) %>%
       select(CONJ, POINT_X, POINT_Y)
-    
-    consumer_list[[obj_name]] <- df
+    consumer_list[[file_path]] <- df
   }
   
   consumer_points <- bind_rows(consumer_list)
-
+  
   consumer_sf <- st_as_sf(consumer_points, coords = c("POINT_X", "POINT_Y"), crs = 4326)
   
-  # Aggregate to centroid per CONJ
   consumer_conj_centroids <- consumer_sf %>%
     group_by(CONJ) %>%
     summarise(geometry = st_centroid(st_union(geometry)), .groups = "drop")
   
-  # save
   saveRDS(consumer_conj_centroids, cleaned_path)
   message("Saved processed CONJ centroids to: ", cleaned_path)
 }
 
-consumer_conj_centroids <-  consumer_conj_centroids %>% 
-  left_join(conj_region_check, join_by(CONJ == consumer_unit_group_id))
-   
-# Join with outage data 
-
-# # Ensure both keys are numeric 
-# out24 <- out24 %>%
-#   mutate(consumer_unit_group_id = as.numeric(consumer_unit_group_id))
-# 
-# consumer_conj_centroids <- consumer_conj_centroids %>%
-#   mutate(CONJ = as.numeric(CONJ))
-
-
-# Join and convert to sf
-out24_geo <- out24 %>%
-  left_join(consumer_conj_centroids, by = c("consumer_unit_group_id" = "CONJ")) %>%
-  st_as_sf(crs = 4326)
-
-# --- Diagnostics ---
-cat("Empty geometries after join:", sum(st_is_empty(out24_geo$geometry)), "\n")
-cat("Total outage rows:", nrow(out24), "\n")
-cat("Unique outage CONJs:", length(unique(out24$consumer_unit_group_id)), "\n")
-cat("Unique geometry CONJs:", length(unique(consumer_conj_centroids$CONJ)), "\n")
-cat("Matched CONJs:", sum(out24$consumer_unit_group_id %in% consumer_conj_centroids$CONJ), "\n")
-cat("Unmatched outage rows:", nrow(out24) - sum(out24$consumer_unit_group_id %in% consumer_conj_centroids$CONJ), "\n")
-
-plot(consumer_conj_centroids)
-
+##########################################
+# Loads or generates a lookup between each CONJ and its intermediate region.
+# Uses three strategies: unique mapping, spatial join via centroid, and majority rule.
 ##########################################
 
-# creating key. CONJ code -> intermediate region
-
 conj_int_path <- here("ANEEL", "IntermediateKey", "conj_int.rds")
-
 muni_meso_lookup <- lookup_muni(name_muni = "all")
 
-# Download all intermediate regions for Brazil and standardize to EPSG:4326
 intermediate_regions <- read_intermediate_region(year = 2020) %>%
   st_transform(4326)
 
 if (file.exists(conj_int_path)) {
   message("Loading CONJ to intermediate region key")
   conj_int <- readRDS(conj_int_path)
-  
 } else {
-  message("Generating key")
+  message("Generating CONJ to intermediate region key")
   
   int_key <- muni_meso_lookup %>%
     select(code_muni, name_muni, code_intermediate, name_intermediate, abbrev_state) %>%
-    left_join(
-      intermediate_regions %>% select(code_intermediate, geom),
-      by = "code_intermediate"
-    )
-  int_key <- st_as_sf(int_key, crs = 4326)
-  ##plotting
-  int_ba <- int_key %>% filter(abbrev_state == "BA" | 
-                                 abbrev_state == "MG"|
-                                 abbrev_state == "ES")
+    left_join(intermediate_regions %>% select(code_intermediate, geom), by = "code_intermediate") %>%
+    st_as_sf(crs = 4326)
   
-  int_key_simple <- ms_simplify(int_ba, keep = 0.05)
-  
-  ggplot(int_key_simple) +
-    geom_sf(aes(fill = name_intermediate), color = NA) +
-    guides(fill = "none") +
-    theme_minimal()
-  
-  # int_key maps CONJ to int code 
-  int_key <- int_key %>% 
+  int_key <- int_key %>%
     left_join(loc, join_by(code_muni == municipality_code)) %>%
-    st_drop_geometry()  # drop geometry early for speed
+    st_drop_geometry()
   
-  # remove duplicates from int_key to get int_sim 
-  int_sim <- int_key %>% 
+  int_sim <- int_key %>%
     select(consumer_unit_group_id, code_intermediate) %>%
-    distinct(consumer_unit_group_id, code_intermediate, .keep_all = TRUE)
+    distinct()
   
   ##########################################
-  # handling conj codes assigned to multiple int regions 
+  # Handles CONJs mapped to more than one intermediate region.
+  # 1. Assign the intermediate region where there is a unique 1:1:1 relationship between conj code, 
+  # municipality, and intermediate region
+  # 2. For codes that have a m:m match between conj code and intermediate region, but the conj code matches 
+  # a point from the _pj dataset, find the intermediate region associated with the point, which will have to fall 
+  # into a single intermediate region
+  # 3. For codes that match to many intermediate regions, and that do not match a point from the _pj 
+  # dataset, use majority rule- ( ex. say a conj code maps to 4 municipalities. if 3 municipalities are in 
+  # one intermediate region, then map the whole conj code to that region). For codes where there 
+  # is not a majority, randomly pick one of the int codes that it matches with.
+  
+  # I have included the method variable which will say by which method each conj is assigned its code. 
+  # the random match is a very small portion of total conj codes
+  ##########################################
   
   conj_region_check <- int_sim %>%
     group_by(consumer_unit_group_id) %>%
-    summarise(n_intermediates = n_distinct(code_intermediate)) %>%
+    summarise(n_intermediates = n_distinct(code_intermediate), .groups = "drop") %>%
     filter(n_intermediates > 1)
   
-  conjdup <- conj_region_check %>% 
-    pull(consumer_unit_group_id)
+  conjdup <- conj_region_check$consumer_unit_group_id
   
-  # CASE 1: assign CONJs with only one region directly
   conj_unique_assigned <- int_sim %>%
     group_by(consumer_unit_group_id) %>%
     filter(n() == 1) %>%
     ungroup() %>%
     mutate(method = "unique_mapping", tie_flag = 0L)
   
-  # CASE 2: Resolve multi-region CONJs via _PJ geometry 
   pj_mapped <- consumer_conj_centroids %>%
     filter(CONJ %in% conjdup) %>%
     st_transform(4326) %>%
@@ -363,7 +328,6 @@ if (file.exists(conj_int_path)) {
     select(consumer_unit_group_id = CONJ, code_intermediate) %>%
     mutate(method = "point_geometry", tie_flag = 1L)
   
-  # CASE 3: For the remaining ambiguous CONJs not covered by _PJ, use majority/random
   remaining_conjs <- setdiff(conjdup, pj_mapped$consumer_unit_group_id)
   
   majority_raw <- int_sim %>%
@@ -380,43 +344,149 @@ if (file.exists(conj_int_path)) {
     group_by(consumer_unit_group_id) %>%
     slice_sample(n = 1) %>%
     ungroup() %>%
-    mutate(
-      method = "majority_rule_or_random",
-      tie_flag = as.integer(is_tie)
-    ) %>%
+    mutate(method = "majority_rule_or_random", tie_flag = as.integer(is_tie)) %>%
     select(-is_tie)
   
-# rbind
-  conj_int <- bind_rows(
-    conj_unique_assigned,
-    pj_mapped,
-    majority_assigned
-  ) %>%
-    distinct(consumer_unit_group_id, .keep_all = TRUE)
+  ##########################################
+  # Handles 4 unmatched CONJs 
+  # Two are resolved via spatial centroid join, two via manual municipality name match.
+  ##########################################
+  unmatched_geo_resolved <- consumer_conj_centroids %>%
+    filter(CONJ %in% c("16719", "16721")) %>%
+    st_transform(4326) %>%
+    st_join(intermediate_regions %>% select(code_intermediate)) %>%
+    select(consumer_unit_group_id = CONJ, code_intermediate) %>%
+    mutate(
+      consumer_unit_group_id = as.character(consumer_unit_group_id),
+      method = "spatial_resolution_unmatched",
+      tie_flag = 1L
+    )
   
-  # save
+  manual_ids <- tibble(
+    consumer_unit_group_id = as.character(c(13646, 16720)),
+    name_muni = c("Natividade", "Alvorada")
+  )
+  
+  manual_assigned <- manual_ids %>%
+    left_join(
+      int_key %>%
+        select(name_muni, code_intermediate) %>%
+        distinct(),
+      by = "name_muni"
+    ) %>%
+    group_by(consumer_unit_group_id) %>%
+    slice_sample(n = 1) %>%  # randomly pick one if there are multiple
+    ungroup() %>%
+    mutate(method = "manual_name_match", tie_flag = 1L)
+  
+  final_manual_resolved <- bind_rows(
+    unmatched_geo_resolved,
+    manual_assigned
+  )
+  
+  ##########################################
+  # Combines all assignment methods into a final CONJ-to-region key
+  # and saves to RDS for future use.
+  ##########################################
+  
+  conj_int <- bind_rows(
+    conj_unique_assigned %>% mutate(consumer_unit_group_id = as.character(consumer_unit_group_id)),
+    pj_mapped %>% mutate(consumer_unit_group_id = as.character(consumer_unit_group_id)),
+    majority_assigned %>% mutate(consumer_unit_group_id = as.character(consumer_unit_group_id)),
+    final_manual_resolved
+  ) %>%
+    distinct(consumer_unit_group_id, .keep_all = TRUE) %>%
+    select(consumer_unit_group_id, code_intermediate, method)
+  
   saveRDS(conj_int, conj_int_path)
   message("Saved CONJ → intermediate region mapping to ", conj_int_path)
 }
 
-nrow(conj_int)==length(unique(int_sim$consumer_unit_group_id)) # works
+##########################################
+# ALL CONJ CODES MAP CHECK
+##########################################
+
+sum(!(unique(out_all$consumer_unit_group_id) %in% conj_int$consumer_unit_group_id))
+
+##########################################
+# Joins CONJ → region mapping to the full outage dataset.
+# Aggregates customer outage hours by region and month.
+##########################################
+
+####################################################
+### STILL WORKING--- need to figure out how to join without hitting vector memory limit 
+
+out_all <- out_all %>%
+  mutate(consumer_unit_group_id = as.character(consumer_unit_group_id))
 
 
-conj_int <- conj_int %>% 
-  select(-c(geometry, n)) %>%  # drop stale geometry
-  left_join(
-    intermediate_regions %>% select(code_intermediate, geometry = geom),
-    by = "code_intermediate"
+library(data.table)
+
+setDT(out_all)
+setDT(conj_int)
+
+out_with_region <- merge(out_all, conj_int, by = "consumer_unit_group_id", all.x = TRUE)
+
+
+out_with_region <- out_all %>%
+  left_join(conj_int, by = "consumer_unit_group_id")
+
+
+names(out_all)
+
+monthly_outages <- out_with_region %>%
+  mutate(
+    year_month = floor_date(interruption_start, unit = "month")
   ) %>%
-  st_as_sf(crs = 4326)  
+  group_by(code_intermediate, year_month) %>%
+  summarise(
+    total_customer_outage_hrs = sum(customer_outage_min, na.rm = TRUE) / 60,
+    n_events = n(),
+    .groups = "drop"
+  )
 
-  out24 <- out24 %>%
-    left_join(conj_int, by = "consumer_unit_group_id")
-  
-  
-  
+n_missing_regions <- sum(is.na(out_with_region$code_intermediate))
+cat("Missing region codes:", n_missing_regions, "\n")
 
-######################################################
+
+conj_int <- conj_int %>%
+  mutate(consumer_unit_group_id = as.character(consumer_unit_group_id))
+
+chunks <- split(out_all, ceiling(seq_len(nrow(out_all)) / 5e6))  # 5M rows per chunk
+
+results <- lapply(chunks, function(chunk) {
+  chunk %>%
+    mutate(consumer_unit_group_id = as.character(consumer_unit_group_id)) %>%
+    left_join(conj_int, by = "consumer_unit_group_id") %>%
+    mutate(year_month = floor_date(interruption_start, unit = "month")) %>%
+    group_by(code_intermediate, year_month) %>%
+    summarise(
+      total_customer_outage_hrs = sum(customer_outage_min, na.rm = TRUE) / 60,
+      n_events = n(),
+      .groups = "drop"
+    )
+})
+
+monthly_outages <- bind_rows(results)
+
+
+write_feather(out_all, "out_all.feather")
+write_feather(conj_int, "conj_int.feather")
+
+out_all_arrow <- open_dataset("out_all.feather")
+conj_int_arrow <- open_dataset("conj_int.feather")
+
+monthly_outages <- out_all_arrow %>%
+  left_join(conj_int_arrow, by = "consumer_unit_group_id") %>%
+  mutate(year_month = floor_date(interruption_start, unit = "month")) %>%
+  group_by(code_intermediate, year_month) %>%
+  summarise(
+    total_customer_outage_hrs = sum(customer_outage_min, na.rm = TRUE) / 60,
+    n_events = n()
+  ) %>%
+  collect()
+
+##############################################################
 
 iso3_code <- "BRA"
 gadm_dir <- here("GADM")
