@@ -29,43 +29,8 @@ library(fasttime)
 library(here)
 library(geobr)
 library(rmapshaper)
+library(fixest)  
 options(scipen=999)
-
-
-wb <- read_excel(here("WBDB", "WB-DB.xlsx"))
-br <- wb %>% 
-  filter(wb$`Economy Name` =="Brazil")
-
-saidi <- br %>% 
-  filter(br$`Indicator ID` == "WB.DB.58" |
-           br$`Indicator ID` == "WB.DB.55" | 
-           br$`Indicator ID` == "WB.DB.56" |
-           br$`Indicator ID` == "WB.DB.57" )
-
-# Getting electricity : System average interruption duration index (SAIDI) (DB16-20 methodology)
-# Getting electricity : System average interruption frequency index (SAIFI) (DB16-20 methodology)
-# Getting electricity : Minimum outage time (in minutes)  (DB16-20 methodology)
-# Getting electricity : Price of electricity (US cents per kWh) (DB16-20 methodology)
-
-
-brwb <- data.frame(
-  year = as.numeric(colnames(saidi)[20:25]), 
-  SAIDI = as.numeric(saidi[1, 20:25]),
-  SAIFI = as.numeric(saidi[2, 20:25]), 
-  minout = as.numeric(saidi[3, 20:25]), 
-  price = as.numeric(saidi[4, 20:25])
-)
-
-ggplot(brwb, aes(x = year)) +
-  geom_line(aes(y = SAIDI, color = "SAIDI"), linewidth = 1) +
-  geom_line(aes(y = SAIFI, color = "SAIFI"), linewidth = 1) +
-  geom_line(aes(y = minout, color = "Minimum Outage Duration"), linewidth = 1) +
-  geom_line(aes(y = price, color = "Avg Price--US cents per kWh"), linewidth = 1) +
-  labs(title = "Utility Performance Indicators",
-       y = "Value",
-       color = "Indicator") +
-  theme_minimal()
-
 
 ############################################################
 # Trial w small df
@@ -413,122 +378,108 @@ sum(!(unique(out_all$consumer_unit_group_id) %in% conj_int$consumer_unit_group_i
 # Aggregates customer outage hours by region and month.
 ##########################################
 
-####################################################
-### STILL WORKING--- need to figure out how to join without hitting vector memory limit 
-
-out_all <- out_all %>%
-  mutate(consumer_unit_group_id = as.character(consumer_unit_group_id))
+# using .feather files and joining on the disk is the best strategy because I hit vector limit on a normal join 
+# but, with arrow I have a mac and the installations of GDAL and arrow packages can error if GDAL installed with homebrew 
+# (which I did). So this is best to run on windows. 
 
 
-library(data.table)
+feather_path <- here("ANEEL", "Feather")
+dir.create(feather_path, showWarnings = FALSE, recursive = TRUE)
 
-setDT(out_all)
-setDT(conj_int)
+rds_path <- here("ANEEL", "monthly_outages.rds")
 
-out_with_region <- merge(out_all, conj_int, by = "consumer_unit_group_id", all.x = TRUE)
+if (file.exists(rds_path)) {
+  monthly_outages <- readRDS(rds_path)
+} else {
+  # Ensure ID is character
+  out_all <- out_all %>%
+    mutate(consumer_unit_group_id = as.character(consumer_unit_group_id))
 
+  write_feather(out_all, file.path(feather_path, "out_all.feather"))
+  write_feather(conj_int, file.path(feather_path, "conj_int.feather"))
+  
 
-out_with_region <- out_all %>%
-  left_join(conj_int, by = "consumer_unit_group_id")
-
-
-names(out_all)
-
-monthly_outages <- out_with_region %>%
-  mutate(
-    year_month = floor_date(interruption_start, unit = "month")
-  ) %>%
-  group_by(code_intermediate, year_month) %>%
-  summarise(
-    total_customer_outage_hrs = sum(customer_outage_min, na.rm = TRUE) / 60,
-    n_events = n(),
-    .groups = "drop"
-  )
-
-n_missing_regions <- sum(is.na(out_with_region$code_intermediate))
-cat("Missing region codes:", n_missing_regions, "\n")
-
-
-conj_int <- conj_int %>%
-  mutate(consumer_unit_group_id = as.character(consumer_unit_group_id))
-
-chunks <- split(out_all, ceiling(seq_len(nrow(out_all)) / 5e6))  # 5M rows per chunk
-
-results <- lapply(chunks, function(chunk) {
-  chunk %>%
-    mutate(consumer_unit_group_id = as.character(consumer_unit_group_id)) %>%
-    left_join(conj_int, by = "consumer_unit_group_id") %>%
+  out_all_arrow <- open_dataset(file.path(feather_path, "out_all.feather"))
+  conj_int_arrow <- open_dataset(file.path(feather_path, "conj_int.feather"))
+  
+  monthly_outages <- out_all_arrow %>%
+    left_join(conj_int_arrow, by = "consumer_unit_group_id") %>%
     mutate(year_month = floor_date(interruption_start, unit = "month")) %>%
     group_by(code_intermediate, year_month) %>%
     summarise(
       total_customer_outage_hrs = sum(customer_outage_min, na.rm = TRUE) / 60,
-      n_events = n(),
-      .groups = "drop"
-    )
-})
-
-monthly_outages <- bind_rows(results)
-
-
-write_feather(out_all, "out_all.feather")
-write_feather(conj_int, "conj_int.feather")
-
-out_all_arrow <- open_dataset("out_all.feather")
-conj_int_arrow <- open_dataset("conj_int.feather")
-
-monthly_outages <- out_all_arrow %>%
-  left_join(conj_int_arrow, by = "consumer_unit_group_id") %>%
-  mutate(year_month = floor_date(interruption_start, unit = "month")) %>%
-  group_by(code_intermediate, year_month) %>%
-  summarise(
-    total_customer_outage_hrs = sum(customer_outage_min, na.rm = TRUE) / 60,
-    n_events = n()
-  ) %>%
-  collect()
-
-##############################################################
-
-iso3_code <- "BRA"
-gadm_dir <- here("GADM")
-
-
-for (i in 0:2) {
-  file_check <- file.path(gadm_dir, "gadm", paste0("gadm41_", iso3_code, "_", i, "_pk.rds"))
+      n_events = n()
+    ) %>%
+    collect()
   
-  if (!file.exists(file_check)) {
-    message("Downloading GADM level ", i, "...")
-    gadm(iso3_code, level = i, path = gadm_dir)
-  } else {
-    message("GADM level ", i, " already exists — skipping download.")
-  }
+  saveRDS(monthly_outages, rds_path)
 }
 
 
-load_gadm <- function(i) {
-  list.files(
-    path = file.path(gadm_dir, "gadm"),
-    pattern = paste0("_", i, "_pk\\.rds$"),
-    full.names = TRUE
+monthly_outages <- monthly_outages %>%
+  mutate(date = as.Date(year_month))
+
+joined_df <- monthly_outages %>%
+  mutate(date = as.Date(year_month)) %>%
+  inner_join(all_lightning, by = c("code_intermediate", "date"))
+
+
+feols(
+  total_customer_outage_hrs ~ density + power_mean,
+  data = joined_df, cluster = ~ code_intermediate
+)
+
+feols(
+  total_customer_outage_hrs ~ density + power_mean + power_sd | code_intermediate + date,
+  data = joined_df
+)
+
+
+feols(
+  total_customer_outage_hrs ~ density | code_intermediate + date,
+  data = joined_df,
+  weights = ~n_events
+)
+
+
+joined_df %>%
+  filter(total_customer_outage_hrs > 0, density > 0) %>%  # remove 0s for log scale
+  ggplot(aes(x = density, y = total_customer_outage_hrs)) +
+  geom_point(alpha = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    x = "Lightning Strike Density (log)",
+    y = "Total Customer Outage Hours (log)",
+    title = "Log-Log Scatter: Lightning vs. Outage Hours"
+  ) +
+  theme_minimal()
+
+
+joined_df %>%
+  mutate(
+    z_density = scale(density)[,1],
+    z_outage = scale(total_customer_outage_hrs)[,1]
   ) %>%
-    map(~ readRDS(.x) %>% st_as_sf()) %>%
-    list_rbind()
-}
-
-roi <- load_gadm(1)
-brazil <- load_gadm(0) %>%
-  st_transform(crs = 4326)
-
-roi_vect <- vect(roi) %>%
-  project("EPSG:4326")  
+  ggplot(aes(x = z_density, y = z_outage)) +
+  geom_point(alpha = 0.5) +
+  labs(
+    x = "Standardized Lightning Density",
+    y = "Standardized Outage Hours",
+    title = "Standardized Scatter: Lightning vs. Outages"
+  ) +
+  theme_minimal()
 
 
-###########################################################
 
+
+#####################################################################
 
 
 # =============================================
 # Lightning Raster Processing Using IBGE Intermediate Regions
 # =============================================
+
 
 
 lightout_dir <- here("Lightning", "Masked")
@@ -734,5 +685,82 @@ plot_power_mean <- function(lightning_sf, year, month) {
 
 plot_power_mean(lightning_sf, 2019, 1)
 plot_power_mean(lightning_sf, 2021, 7)
+
+
+
+wb <- read_excel(here("WBDB", "WB-DB.xlsx"))
+br <- wb %>% 
+  filter(wb$`Economy Name` =="Brazil")
+
+saidi <- br %>% 
+  filter(br$`Indicator ID` == "WB.DB.58" |
+           br$`Indicator ID` == "WB.DB.55" | 
+           br$`Indicator ID` == "WB.DB.56" |
+           br$`Indicator ID` == "WB.DB.57" )
+
+# Getting electricity : System average interruption duration index (SAIDI) (DB16-20 methodology)
+# Getting electricity : System average interruption frequency index (SAIFI) (DB16-20 methodology)
+# Getting electricity : Minimum outage time (in minutes)  (DB16-20 methodology)
+# Getting electricity : Price of electricity (US cents per kWh) (DB16-20 methodology)
+
+
+brwb <- data.frame(
+  year = as.numeric(colnames(saidi)[20:25]), 
+  SAIDI = as.numeric(saidi[1, 20:25]),
+  SAIFI = as.numeric(saidi[2, 20:25]), 
+  minout = as.numeric(saidi[3, 20:25]), 
+  price = as.numeric(saidi[4, 20:25])
+)
+
+ggplot(brwb, aes(x = year)) +
+  geom_line(aes(y = SAIDI, color = "SAIDI"), linewidth = 1) +
+  geom_line(aes(y = SAIFI, color = "SAIFI"), linewidth = 1) +
+  geom_line(aes(y = minout, color = "Minimum Outage Duration"), linewidth = 1) +
+  geom_line(aes(y = price, color = "Avg Price--US cents per kWh"), linewidth = 1) +
+  labs(title = "Utility Performance Indicators",
+       y = "Value",
+       color = "Indicator") +
+  theme_minimal()
+
+
+
+
+##############################################################
+
+iso3_code <- "BRA"
+gadm_dir <- here("GADM")
+
+
+for (i in 0:2) {
+  file_check <- file.path(gadm_dir, "gadm", paste0("gadm41_", iso3_code, "_", i, "_pk.rds"))
+  
+  if (!file.exists(file_check)) {
+    message("Downloading GADM level ", i, "...")
+    gadm(iso3_code, level = i, path = gadm_dir)
+  } else {
+    message("GADM level ", i, " already exists — skipping download.")
+  }
+}
+
+
+load_gadm <- function(i) {
+  list.files(
+    path = file.path(gadm_dir, "gadm"),
+    pattern = paste0("_", i, "_pk\\.rds$"),
+    full.names = TRUE
+  ) %>%
+    map(~ readRDS(.x) %>% st_as_sf()) %>%
+    list_rbind()
+}
+
+roi <- load_gadm(1)
+brazil <- load_gadm(0) %>%
+  st_transform(crs = 4326)
+
+roi_vect <- vect(roi) %>%
+  project("EPSG:4326")  
+
+
+###########################################################
 
 
