@@ -30,6 +30,7 @@ library(here)
 library(geobr)
 library(rmapshaper)
 library(fixest)  
+library(sidrar)
 options(scipen=999)
 
 ############################################################
@@ -168,6 +169,7 @@ if (!file.exists(output_file)) {
   cat("File already exists at:", output_file, "\nLoading from disk.\n")
   out_all <- readRDS(output_file)
 }
+
 
 ##########################################
 # Loads the CONJ-to-municipality lookup table from ANEEL.
@@ -316,6 +318,8 @@ if (file.exists(conj_int_path)) {
   # Handles 4 unmatched CONJs 
   # Two are resolved via spatial centroid join, two via manual municipality name match.
   ##########################################
+  
+  # double check matches 
   unmatched_geo_resolved <- consumer_conj_centroids %>%
     filter(CONJ %in% c("16719", "16721")) %>%
     st_transform(4326) %>%
@@ -332,6 +336,12 @@ if (file.exists(conj_int_path)) {
     name_muni = c("Natividade", "Alvorada")
   )
   
+  check <- out_all %>% 
+    filter(consumer_unit_group_id %in% c(16719,16721,13646,16720 ))
+  
+  conj_int %>%  
+    filter(consumer_unit_group_id == 13646)
+    
   manual_assigned <- manual_ids %>%
     left_join(
       int_key %>%
@@ -353,7 +363,7 @@ if (file.exists(conj_int_path)) {
   # Combines all assignment methods into a final CONJ-to-region key
   # and saves to RDS for future use.
   ##########################################
-  
+  # Final CONJ → intermediate region mapping with customer count
   conj_int <- bind_rows(
     conj_unique_assigned %>% mutate(consumer_unit_group_id = as.character(consumer_unit_group_id)),
     pj_mapped %>% mutate(consumer_unit_group_id = as.character(consumer_unit_group_id)),
@@ -361,11 +371,40 @@ if (file.exists(conj_int_path)) {
     final_manual_resolved
   ) %>%
     distinct(consumer_unit_group_id, .keep_all = TRUE) %>%
-    select(consumer_unit_group_id, code_intermediate, method)
+    select(consumer_unit_group_id, code_intermediate, method) %>%
+    left_join(served_customers, by = "consumer_unit_group_id")
   
   saveRDS(conj_int, conj_int_path)
   message("Saved CONJ → intermediate region mapping to ", conj_int_path)
 }
+
+
+sum(is.na(out_all$group_consumer_count))
+sum(is.na(conj_int$group_consumer_count_avg))
+
+no_match <- setdiff(conj_int$consumer_unit_group_id, out_all$consumer_unit_group_id)
+
+
+conj_comparison <- conj_int %>%
+  mutate(
+    match_status = if_else(consumer_unit_group_id %in% no_match, "not_matched", "matched")
+  )
+
+# Compare tie_flag distribution by match status
+tie_flag_summary <- conj_comparison %>%
+  group_by(match_status, method) %>%
+  summarise(n = n()) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  arrange(match_status, desc(method))
+
+out_all %>%  
+  filter(consumer_unit_group_id == "6459")
+
+ggplot(tie_flag_summary, aes(x = as.factor(method), y = pct, fill = match_status)) +
+  geom_col(position = "dodge") +
+  labs(x = "Tie Flag", y = "Percent", fill = "Match Status", title = "Tie Flag Distribution by CONJ Match Status") +
+  theme_minimal()
+
 
 ##########################################
 # ALL CONJ CODES MAP CHECK
@@ -416,27 +455,75 @@ if (file.exists(rds_path)) {
 }
 
 
+
+###########################################
+# Population by Intermediate Regions
+###########################################
+
+pop_data <- get_sidra(x = 6579, variable = 9324, period = "2020", geo = "City")
+
+pop_muni <- pop_data %>%
+  transmute(
+    code_muni = as.character(`Município (Código)`),
+    pop_2020 = as.numeric(`Valor`)
+  )
+
+muni_lookup <- lookup_muni(name_muni = "all") %>%
+  select(code_muni, code_intermediate) %>% 
+  mutate(code_muni = as.character(code_muni))
+
+
+# Manual assignment for unmatched municipalities
+manual_fixes <- tibble(
+  code_muni = c("1504752", "4212650", "4220000", "4314548", "5006275"),
+  code_intermediate = c(1505, 4202, 4202, 4307, 5001)
+)
+
+muni_lookup_fixed <- bind_rows(muni_lookup, manual_fixes)
+
+pop_intermediate <- pop_muni %>%
+  left_join(muni_lookup_fixed, by = "code_muni") %>%
+  group_by(code_intermediate) %>%
+  summarise(int_pop_2020 = sum(pop_2020, na.rm = TRUE)) %>%
+  arrange(code_intermediate)
+
+conj_int <- conj_int %>%  
+  left_join(pop_intermediate, join_by(code_intermediate))
+
+
 monthly_outages <- monthly_outages %>%
-  mutate(date = as.Date(year_month))
+  left_join(
+    conj_int %>% select(code_intermediate, int_pop_2020) %>% distinct(),
+    by = "code_intermediate"
+  ) %>% 
+  mutate( outage_hrs = total_customer_outage_hrs*1000/int_pop_2020
+  ) %>%  
+  select(-int_pop_2020)
+
+
+############################################################
+
+monthly_outages <- monthly_outages %>%
+  mutate(date = as.Date(year_month)) %>%  
+  select(-year_month)
 
 joined_df <- monthly_outages %>%
-  mutate(date = as.Date(year_month)) %>%
   inner_join(all_lightning, by = c("code_intermediate", "date"))
 
 
 feols(
-  total_customer_outage_hrs ~ density + power_mean,
+outage_hrs ~ density + power_mean,
   data = joined_df, cluster = ~ code_intermediate
 )
 
 feols(
-  total_customer_outage_hrs ~ density + power_mean + power_sd | code_intermediate + date,
+outage_hrs ~ density + power_mean + power_sd | code_intermediate + date,
   data = joined_df
 )
 
 
 feols(
-  total_customer_outage_hrs ~ density | code_intermediate + date,
+outage_hrs ~ density | code_intermediate + date,
   data = joined_df,
   weights = ~n_events
 )
@@ -468,6 +555,7 @@ joined_df %>%
     y = "Standardized Outage Hours",
     title = "Standardized Scatter: Lightning vs. Outages"
   ) +
+  geom_smooth(method = "lm")+
   theme_minimal()
 
 
@@ -724,8 +812,37 @@ ggplot(brwb, aes(x = year)) +
 
 
 
+##############################################################
+
+# Create a temp dir
+dir.create("chirps_monthly", showWarnings = FALSE)
+
+# Function to download one month
+download_chirps_month <- function(year, month) {
+  yyyymm <- sprintf("%04d.%02d", year, month)
+  url <- paste0("https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_monthly/tifs/chirps-v2.0.", yyyymm, ".tif.gz")
+  dest_gz <- file.path("chirps_monthly", basename(url))
+  dest_tif <- sub(".gz$", "", dest_gz)
+  
+  if (!file.exists(dest_tif)) {
+    download.file(url, dest_gz, mode = "wb")
+    R.utils::gunzip(dest_gz, remove = TRUE)
+  }
+  
+  return(dest_tif)
+}
+
+# Download data for all months in 2020 and 2021
+library(R.utils)
+years <- 2020:2021
+months <- 1:12
+tif_paths <- unlist(lapply(years, function(y) sapply(months, function(m) download_chirps_month(y, m))))
+
+
 
 ##############################################################
+
+
 
 iso3_code <- "BRA"
 gadm_dir <- here("GADM")
