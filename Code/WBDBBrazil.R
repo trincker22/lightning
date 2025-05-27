@@ -1021,3 +1021,121 @@ roi_vect <- vect(roi) %>%
 ###########################################################
 
 
+# Setup directories
+dirs <- c("LandCover", "NTL", "Elevation")
+for (d in dirs) {
+  dir.create(d, showWarnings = FALSE)
+  dir.create(file.path(d, "Raw"), showWarnings = FALSE)
+}
+
+ee <- import("ee")
+ee$Initialize()
+
+bbox <- st_bbox(brazil)
+brazil_ee <- ee$Geometry$Rectangle(
+  coords = as.numeric(c(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"])),
+  proj = "EPSG:4326"
+)
+
+# LAND COVER (ESA WorldCover, annual)
+years <- 2017:2021
+for (yr in years) {
+  img <- ee$ImageCollection('ESA/WorldCover/v100')$
+    filter(ee$Filter$eq('year', yr))$
+    first()$
+    clip(brazil_ee)
+  
+  url <- img$getDownloadURL(list(
+    scale = 10,
+    region = brazil_ee$bounds()$getInfo()$coordinates,
+    format = "GEO_TIFF"
+  ))
+  
+  download.file(url, file.path("LandCover", "Raw", paste0("LandCover_", yr, ".tif")), mode = "wb")
+}
+
+# NIGHTTIME LIGHTS (VIIRS, monthly)
+for (d in months) {
+  start_date <- format(as.Date(d), "%Y-%m-%d")
+  end_date <- format(seq(d, length = 2, by = "1 month") - 1, "%Y-%m-%d")
+  
+  img <- ee$ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG')$
+    filterDate(start_date, end_date)$
+    first()$
+    select('avg_rad')$
+    clip(brazil_ee)
+  
+  url <- img$getDownloadURL(list(
+    scale = 500,
+    region = brazil_ee$bounds()$getInfo()$coordinates,
+    format = "GEO_TIFF"
+  ))
+  
+  download.file(url, file.path("NTL", "Raw", paste0("NTL_", format(d, "%Y%m"), ".tif")), mode = "wb")
+}
+
+
+# ELEVATION (SRTM, static)
+elev_img <- ee$Image('USGS/SRTMGL1_003')$
+  clip(brazil_ee)
+
+elev_url <- elev_img$getDownloadURL(list(
+  scale = 30,
+  region = brazil_ee$bounds()$getInfo()$coordinates,
+  format = "GEO_TIFF"
+))
+
+download.file(elev_url, file.path("Elevation", "Raw", "Elevation_SRTM.tif"), mode = "wb")
+
+
+# NIGHTTIME LIGHTS
+ntl_stack <- rast(list.files(file.path("NTL", "Raw"), pattern = "\\.tif$", full.names = TRUE))
+ntl_results <- exact_extract(
+  ntl_stack,
+  st_transform(intermediate_regions, crs(ntl_stack)),
+  fun = "mean",
+  append_cols = "code_intermediate"
+)
+ntl_df <- ntl_results %>%
+  pivot_longer(-code_intermediate, names_to = "name", values_to = "ntl_value") %>%
+  mutate(
+    date = ymd(paste0(str_extract(name, "\\d{6}"), "01")),
+    .keep = "unused"
+  ) %>%
+  select(date, code_intermediate, avg_ntl = ntl_value)
+
+# LAND COVER
+landcover_stack <- rast(list.files(file.path("LandCover", "Raw"), pattern = "\\.tif$", full.names = TRUE))
+lc_results <- exact_extract(
+  landcover_stack,
+  st_transform(intermediate_regions, crs(landcover_stack)),
+  fun = "mean",
+  append_cols = "code_intermediate"
+)
+lc_df <- lc_results %>%
+  pivot_longer(-code_intermediate, names_to = "name", values_to = "landcover_value") %>%
+  mutate(
+    year = str_extract(name, "\\d{4}"),
+    date = ymd(paste0(year, "-01-01")),
+    .keep = "unused"
+  ) %>%
+  select(date, code_intermediate, avg_landcover = landcover_value)
+
+# ELEVATION
+elev_raster <- rast(list.files(file.path("Elevation", "Raw"), pattern = "\\.tif$", full.names = TRUE))
+elev_results <- exact_extract(
+  elev_raster,
+  st_transform(intermediate_regions, crs(elev_raster)),
+  fun = "mean",
+  append_cols = "code_intermediate"
+)
+elev_df <- elev_results %>%
+  select(code_intermediate, avg_elevation = mean)
+
+elev_df_expanded <- expand.grid(
+  code_intermediate = elev_df$code_intermediate,
+  date = ntl_df$date  # match monthly dates
+) %>%
+  left_join(elev_df, by = "code_intermediate")
+
+
