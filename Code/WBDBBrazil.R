@@ -31,6 +31,7 @@ library(geobr)
 library(rmapshaper)
 library(fixest)  
 library(sidrar)
+library(reticulate)
 options(scipen=999)
 
 ############################################################
@@ -250,6 +251,17 @@ if (file.exists(conj_int_path)) {
     select(code_muni, name_muni, code_intermediate, name_intermediate, abbrev_state) %>%
     left_join(intermediate_regions %>% select(code_intermediate, geom), by = "code_intermediate") %>%
     st_as_sf(crs = 4326)
+  
+  int_ba <- int_key %>% filter(abbrev_state == "BA" | 
+                                 abbrev_state == "MG"|
+                                 abbrev_state == "ES")
+  
+  int_key_simple <- ms_simplify(int_ba, keep = 0.05)
+  
+  ggplot(int_key_simple) +
+    geom_sf(aes(fill = name_intermediate), color = NA) +
+    guides(fill = "none") +
+    theme_minimal()
   
   int_key <- int_key %>%
     left_join(loc, join_by(code_muni == municipality_code)) %>%
@@ -511,21 +523,21 @@ joined_df <- monthly_outages %>%
   inner_join(all_lightning, by = c("code_intermediate", "date"))
 
 
+joined_df <- temp_df %>%
+  left_join(joined_df, by = c("code_intermediate", "date"))
+
+
+
+  
+
 feols(
-outage_hrs ~ density + power_mean,
+outage_hrs ~ density + precip_mm,
   data = joined_df, cluster = ~ code_intermediate
 )
 
 feols(
-outage_hrs ~ density + power_mean + power_sd | code_intermediate + date,
+outage_hrs ~ density + power_mean + precip_mm| code_intermediate + date,
   data = joined_df
-)
-
-
-feols(
-outage_hrs ~ density | code_intermediate + date,
-  data = joined_df,
-  weights = ~n_events
 )
 
 
@@ -555,7 +567,7 @@ joined_df %>%
     y = "Standardized Outage Hours",
     title = "Standardized Scatter: Lightning vs. Outages"
   ) +
-  geom_smooth(method = "lm")+
+  geom_smooth()+
   theme_minimal()
 
 
@@ -776,6 +788,162 @@ plot_power_mean(lightning_sf, 2021, 7)
 
 
 
+
+
+##############################################################
+
+# Create a temp dir
+dir.create("Rainfall", showWarnings = F, recursive = T)
+dir.create("Rainfall/TIFs", showWarnings = FALSE, recursive = TRUE)
+
+
+download_chirps_month <- function(year, month) {
+  yyyymm <- sprintf("%04d.%02d", year, month)
+  url <- paste0("https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_monthly/tifs/chirps-v2.0.", yyyymm, ".tif.gz")
+  dest_gz <- file.path("Rainfall", "TIFs", basename(url))
+  dest_tif <- sub(".gz$", "", dest_gz)
+  
+  if (!file.exists(dest_tif)) {
+    download.file(url, dest_gz, mode = "wb")
+    R.utils::gunzip(dest_gz, remove = TRUE)
+  }
+  
+  return(dest_tif)
+}
+
+years <- 2017:2021
+months <- 1:12
+tif_paths <- unlist(lapply(years, function(y) sapply(months, function(m) download_chirps_month(y, m))))
+
+
+intermediates <- read_intermediate_region(year = 2020) %>%
+  st_transform(4326)  # Match CHIRPS CRS
+
+# List all unzipped .tif files
+tif_files <- list.files("Rainfall/TIFs", pattern = "\\.tif$", full.names = TRUE)
+
+# Initialize an output data frame
+rainfall_df <- data.frame()
+
+for (file in tif_files) {
+  r <- rast(file)
+  
+  # Set -9999 as NA
+  r[r == -9999] <- NA
+  
+  date <- ymd(paste0(str_extract(basename(file), "\\d{4}\\.\\d{2}"), ".01"))
+  mean_vals <- exact_extract(r, intermediates, 'mean')
+  
+  rainfall_df <- bind_rows(rainfall_df, tibble(
+    code_intermediate = intermediates$code_intermediate,
+    date = date,
+    precip_mm = mean_vals
+  ))
+}
+
+rainfall_df <- rainfall_df %>%
+  mutate(precip_mm = ifelse(precip_mm < 0, NA, precip_mm))
+
+
+joined_df <- joined_df %>%
+  left_join(rainfall_df, by = c("code_intermediate", "date"))
+
+#######################################################################
+# Avg temp download
+# Initialize Earth Engine
+
+ee <- import("ee")
+ee$Initialize()
+
+# 1. Setup -----------------------------------------------------------------
+# Create Temp and TempRaw folders if needed
+if (!dir.exists("Temp")) dir.create("Temp")
+if (!dir.exists(file.path("Temp", "TIFs"))) dir.create(file.path("Temp", "TIFs"))
+
+# Convert Brazil sf to EE Geometry
+bbox <- st_bbox(brazil)
+brazil_ee <- ee$Geometry$Rectangle(
+  coords = as.numeric(c(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"])),
+  proj = "EPSG:4326"
+)
+
+# 2. Download Data --------------------------------------------------------
+dates <- seq(as.Date("2017-01-01"), as.Date("2021-12-31"), by = "month")
+
+download_era5 <- function(date, out_dir = file.path("Temp", "TIFs")) {
+  tif_file <- file.path(out_dir, paste0(format(date, "%Y%m"), ".tif"))
+  
+  if (file.exists(tif_file)) return(TRUE)
+  
+  img <- ee$ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')$
+    filter(ee$Filter$date(format(date, "%Y-%m-%d")))$
+    first()$
+    select('temperature_2m')$
+    clip(brazil_ee)
+  
+  url <- img$getDownloadURL(list(
+    scale = 10000,
+    region = brazil_ee$bounds()$getInfo()$coordinates,
+    format = "GEO_TIFF",
+    filePerBand = FALSE
+  ))
+  
+  download.file(url, tif_file, mode = "wb")
+}
+
+# Download all months (with progress)
+purrr::walk(dates, function(d) {
+  tryCatch(
+    {
+      download_era5(d)
+      message("Downloaded: ", format(d, "%Y-%m"))
+    },
+    error = function(e) message("Failed ", format(d, "%Y-%m"), ": ", e$message)
+  )
+})
+
+# 3. Process Data ---------------------------------------------------------
+temp_df_path <- file.path("Temp", "temp_df.rds")
+
+if (file.exists(temp_df_path)) {
+  message("Loading saved temp_df...")
+  temp_df <- readRDS(temp_df_path)
+} else {
+  message("Processing raw .tif files...")
+  # Load all downloaded files
+  temp_stack <- rast(list.files(file.path("Temp", "TIFs"), pattern = "\\.tif$", full.names = TRUE))
+  
+  # Extract zonal means
+  results <- exact_extract(
+    temp_stack,
+    st_transform(intermediate_regions, crs(temp_stack)),
+    fun = "mean",
+    append_cols = "code_intermediate"  # Your region ID column
+  )
+  
+  # Create final dataframe
+  temp_df <- results %>%
+    pivot_longer(
+      cols = -code_intermediate,
+      names_to = "name",
+      values_to = "temp_k"
+    ) %>%
+    mutate(
+      date = ymd(paste0(str_extract(name, "\\d{6}"), "01")),
+      temp_f = (temp_k - 273.15) * 9/5 + 32,
+      .keep = "unused"
+    ) %>%
+    select(date, code_intermediate, avg_temp = temp_f) %>%
+    arrange(code_intermediate, date)
+  
+  # Save for future use
+  saveRDS(temp_df, temp_df_path)
+  message("Saved processed temp_df to: ", temp_df_path)
+}
+
+
+##################################################################
+
 wb <- read_excel(here("WBDB", "WB-DB.xlsx"))
 br <- wb %>% 
   filter(wb$`Economy Name` =="Brazil")
@@ -811,35 +979,6 @@ ggplot(brwb, aes(x = year)) +
   theme_minimal()
 
 
-
-##############################################################
-
-# Create a temp dir
-dir.create("chirps_monthly", showWarnings = FALSE)
-
-# Function to download one month
-download_chirps_month <- function(year, month) {
-  yyyymm <- sprintf("%04d.%02d", year, month)
-  url <- paste0("https://data.chc.ucsb.edu/products/CHIRPS-2.0/global_monthly/tifs/chirps-v2.0.", yyyymm, ".tif.gz")
-  dest_gz <- file.path("chirps_monthly", basename(url))
-  dest_tif <- sub(".gz$", "", dest_gz)
-  
-  if (!file.exists(dest_tif)) {
-    download.file(url, dest_gz, mode = "wb")
-    R.utils::gunzip(dest_gz, remove = TRUE)
-  }
-  
-  return(dest_tif)
-}
-
-# Download data for all months in 2020 and 2021
-library(R.utils)
-years <- 2020:2021
-months <- 1:12
-tif_paths <- unlist(lapply(years, function(y) sapply(months, function(m) download_chirps_month(y, m))))
-
-
-
 ##############################################################
 
 
@@ -869,6 +1008,7 @@ load_gadm <- function(i) {
     map(~ readRDS(.x) %>% st_as_sf()) %>%
     list_rbind()
 }
+
 
 roi <- load_gadm(1)
 brazil <- load_gadm(0) %>%
