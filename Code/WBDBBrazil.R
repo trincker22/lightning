@@ -32,7 +32,14 @@ library(rmapshaper)
 library(fixest)  
 library(sidrar)
 library(reticulate)
+library(jsonlite)
+library(marginaleffects)
+
 options(scipen=999)
+
+############################################################
+
+# SECTION 1: ANEEL
 
 ############################################################
 # Trial w small df
@@ -74,6 +81,10 @@ out24 %>%
   geom_histogram()
 
 
+
+############################################################
+
+#ANEEL Full Outage Processing 
 
 ############################################################
 
@@ -171,6 +182,13 @@ if (!file.exists(output_file)) {
   out_all <- readRDS(output_file)
 }
 
+
+
+############################################################
+
+# ANEEL Building Join Key
+
+############################################################
 
 ##########################################
 # Loads the CONJ-to-municipality lookup table from ANEEL.
@@ -468,9 +486,11 @@ if (file.exists(rds_path)) {
 
 
 
-###########################################
+####################################################
+
 # Population by Intermediate Regions
-###########################################
+
+###################################################
 
 pop_data <- get_sidra(x = 6579, variable = 9324, period = "2020", geo = "City")
 
@@ -512,73 +532,42 @@ monthly_outages <- monthly_outages %>%
   ) %>%  
   select(-int_pop_2020)
 
-
-############################################################
-
 monthly_outages <- monthly_outages %>%
   mutate(date = as.Date(year_month)) %>%  
   select(-year_month)
 
-joined_df <- monthly_outages %>%
-  inner_join(all_lightning, by = c("code_intermediate", "date"))
 
-
-joined_df <- temp_df %>%
-  left_join(joined_df, by = c("code_intermediate", "date"))
-
-
-
-  
-
-feols(
-outage_hrs ~ density + precip_mm,
-  data = joined_df, cluster = ~ code_intermediate
-)
-
-feols(
-outage_hrs ~ density + power_mean + precip_mm| code_intermediate + date,
-  data = joined_df
+region_ids <- unique(monthly_outages$code_intermediate)
+month_seq <- seq.Date(
+  from = as.Date("2017-01-01"),
+  to = max(monthly_outages$date),
+  by = "month"
 )
 
 
-joined_df %>%
-  filter(total_customer_outage_hrs > 0, density > 0) %>%  # remove 0s for log scale
-  ggplot(aes(x = density, y = total_customer_outage_hrs)) +
-  geom_point(alpha = 0.5) +
-  scale_x_log10() +
-  scale_y_log10() +
-  labs(
-    x = "Lightning Strike Density (log)",
-    y = "Total Customer Outage Hours (log)",
-    title = "Log-Log Scatter: Lightning vs. Outage Hours"
-  ) +
-  theme_minimal()
+full_grid <- expand_grid(
+  code_intermediate = region_ids,
+  date = month_seq
+)
 
 
-joined_df %>%
+monthly_outages <- full_grid %>%
+  left_join(monthly_outages, by = c("code_intermediate", "date")) %>%
+  group_by(code_intermediate) %>%
+  fill(int_pop_2020, .direction = "downup") %>%  # ensure population is filled within region
+  ungroup() %>%
   mutate(
-    z_density = scale(density)[,1],
-    z_outage = scale(total_customer_outage_hrs)[,1]
-  ) %>%
-  ggplot(aes(x = z_density, y = z_outage)) +
-  geom_point(alpha = 0.5) +
-  labs(
-    x = "Standardized Lightning Density",
-    y = "Standardized Outage Hours",
-    title = "Standardized Scatter: Lightning vs. Outages"
-  ) +
-  geom_smooth()+
-  theme_minimal()
+    total_customer_outage_hrs = replace_na(total_customer_outage_hrs, 0),
+    n_events = replace_na(n_events, 0),
+    outage_hrs = if_else(is.na(outage_hrs), 0, outage_hrs)
+  ) %>% filter(!is.na(code_intermediate))
 
 
+##################################################################
 
+# Lightning Raster Processing Using IBGE Intermediate Regions
 
 #####################################################################
-
-
-# =============================================
-# Lightning Raster Processing Using IBGE Intermediate Regions
-# =============================================
 
 
 
@@ -727,12 +716,10 @@ if (needs_processing) {
   message("Data processing complete and saved")
 }
 
-
-
-#########################################
+###############################################
 
 # ---------------------------------------------
-# Plotting Functions 
+# Lightning Plotting Functions 
 # ---------------------------------------------
 
 
@@ -788,11 +775,19 @@ plot_power_mean(lightning_sf, 2021, 7)
 
 
 
-
-
 ##############################################################
 
-# Create a temp dir
+
+# Creating Control Vars: Rainfall, Temperature, Land Cover, Elevation
+
+
+#############################################################
+
+
+
+# 1. Rainfall-----------------------------------------------------------
+
+
 dir.create("Rainfall", showWarnings = F, recursive = T)
 dir.create("Rainfall/TIFs", showWarnings = FALSE, recursive = TRUE)
 
@@ -848,37 +843,51 @@ rainfall_df <- rainfall_df %>%
 joined_df <- joined_df %>%
   left_join(rainfall_df, by = c("code_intermediate", "date"))
 
-#######################################################################
-# Avg temp download
-# Initialize Earth Engine
+
+# 2. Weather  -----------------------------------------------------------
 
 ee <- import("ee")
 ee$Initialize()
 
-# 1. Setup -----------------------------------------------------------------
-# Create Temp and TempRaw folders if needed
-if (!dir.exists("Temp")) dir.create("Temp")
-if (!dir.exists(file.path("Temp", "TIFs"))) dir.create(file.path("Temp", "TIFs"))
 
-# Convert Brazil sf to EE Geometry
+dir.create("Temp", showWarnings = FALSE)
+dir.create("Temp/TIFs", showWarnings = FALSE)
+era5_df_path <- file.path("Temp", "era5_df.rds")
+
+
+if (file.exists(era5_df_path)) {
+  message("Loading ERA5 data from file...")
+  era5_df <- readRDS(era5_df_path)
+  
+} else {
+
 bbox <- st_bbox(brazil)
 brazil_ee <- ee$Geometry$Rectangle(
   coords = as.numeric(c(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"])),
   proj = "EPSG:4326"
 )
 
-# 2. Download Data --------------------------------------------------------
-dates <- seq(as.Date("2017-01-01"), as.Date("2021-12-31"), by = "month")
+dates <- seq(as.Date("2017-01-01"), as.Date("2021-12-01"), by = "month")
 
-download_era5 <- function(date, out_dir = file.path("Temp", "TIFs")) {
-  tif_file <- file.path(out_dir, paste0(format(date, "%Y%m"), ".tif"))
-  
-  if (file.exists(tif_file)) return(TRUE)
+bands <- c(
+  "temperature_2m",
+  "total_precipitation_sum",
+  "dewpoint_temperature_2m",
+  "surface_pressure",
+  "total_evaporation_sum",
+  "runoff_sum"
+)
+
+# Download function for multi-band TIFFs
+download_era5 <- function(date, out_dir = "Temp/TIFs") {
+  fname <- paste0(format(date, "%Y%m"), ".tif")
+  tif_file <- file.path(out_dir, fname)
+  if (file.exists(tif_file)) return(tif_file)
   
   img <- ee$ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')$
     filter(ee$Filter$date(format(date, "%Y-%m-%d")))$
     first()$
-    select('temperature_2m')$
+    select(bands)$
     clip(brazil_ee)
   
   url <- img$getDownloadURL(list(
@@ -888,61 +897,194 @@ download_era5 <- function(date, out_dir = file.path("Temp", "TIFs")) {
     filePerBand = FALSE
   ))
   
-  download.file(url, tif_file, mode = "wb")
+  tryCatch({
+    download.file(url, tif_file, mode = "wb")
+    message("Downloaded:", basename(tif_file))
+  }, error = function(e) {
+    message("Download failed for ", format(date, "%Y-%m"))
+    return(NULL)
+  })
+  
+  return(tif_file)
 }
-
-# Download all months (with progress)
-purrr::walk(dates, function(d) {
-  tryCatch(
-    {
-      download_era5(d)
-      message("Downloaded: ", format(d, "%Y-%m"))
-    },
-    error = function(e) message("Failed ", format(d, "%Y-%m"), ": ", e$message)
+# Loop: download and extract all months
+all_dfs <- map_dfr(dates, function(date) {
+  tif_path <- download_era5(date)
+  if (is.null(tif_path)) return(NULL)
+  
+  # Load raster and manually assign correct band names
+  r <- rast(tif_path)
+  names(r) <- c(
+    "temperature_2m",
+    "total_precipitation_sum",
+    "dewpoint_temperature_2m",
+    "surface_pressure",
+    "total_evaporation_sum",
+    "runoff_sum"
   )
-})
-
-# 3. Process Data ---------------------------------------------------------
-temp_df_path <- file.path("Temp", "temp_df.rds")
-
-if (file.exists(temp_df_path)) {
-  message("Loading saved temp_df...")
-  temp_df <- readRDS(temp_df_path)
-} else {
-  message("Processing raw .tif files...")
-  # Load all downloaded files
-  temp_stack <- rast(list.files(file.path("Temp", "TIFs"), pattern = "\\.tif$", full.names = TRUE))
   
   # Extract zonal means
-  results <- exact_extract(
-    temp_stack,
-    st_transform(intermediate_regions, crs(temp_stack)),
+  extracted <- exact_extract(
+    r,
+    st_transform(intermediate_regions, crs(r)),
     fun = "mean",
-    append_cols = "code_intermediate"  # Your region ID column
-  )
-  
-  # Create final dataframe
-  temp_df <- results %>%
+    append_cols = "code_intermediate"
+  ) %>%
     pivot_longer(
       cols = -code_intermediate,
-      names_to = "name",
-      values_to = "temp_k"
+      names_to = "variable",
+      values_to = "value"
     ) %>%
     mutate(
-      date = ymd(paste0(str_extract(name, "\\d{6}"), "01")),
-      temp_f = (temp_k - 273.15) * 9/5 + 32,
-      .keep = "unused"
-    ) %>%
-    select(date, code_intermediate, avg_temp = temp_f) %>%
-    arrange(code_intermediate, date)
+      variable = str_remove(variable, "^mean\\."),
+      date = date
+    )
   
-  # Save for future use
-  saveRDS(temp_df, temp_df_path)
-  message("Saved processed temp_df to: ", temp_df_path)
+  return(extracted)
+})
+
+
+# Tidy to wide and apply unit conversions
+era5_df <- all_dfs %>%
+  pivot_wider(names_from = variable, values_from = value) %>%
+  mutate(
+    avg_temp     = (temperature_2m - 273.15) * 9/5 + 32,
+    precip_mm    = total_precipitation_sum * 1000,
+    dewpoint_f   = (dewpoint_temperature_2m - 273.15) * 9/5 + 32,
+    pressure_hpa = surface_pressure / 100,
+    evap_mm      = total_evaporation_sum * 1000,
+    runoff_mm    = runoff_sum * 1000
+  ) %>%
+  select(code_intermediate, date, avg_temp, precip_mm, dewpoint_f, pressure_hpa, evap_mm, runoff_mm) %>%
+  arrange(code_intermediate, date)
+
+
+saveRDS(era5_df, file.path("Temp", "era5_df.rds"))
+
+message("ERA5 data saved to: ", era5_df_path)
 }
 
 
+# 3. Land Cover -----------------------------------------------------
+
+# File path to save/load processed RDS
+landcover_rds_path <- here("LandCover", "landcover_final.rds")
+
+if (file.exists(landcover_rds_path)) {
+  message("Loading processed landcover data from RDS...")
+  landcover_final <- readRDS(landcover_rds_path)
+} else {
+  message("Processing landcover data...")
+  
+  landcover_dir <- here("LandCover", "Raw")
+  all_years <- list.files(path = landcover_dir, pattern = "Brazil_LandCover_\\d{4}_summary.csv", full.names = TRUE)
+  
+  igbp_classes <- tibble(
+    code = as.character(1:17),
+    name = c(
+      "evergreen_needleleaf_forest",
+      "evergreen_broadleaf_forest",
+      "deciduous_needleleaf_forest",
+      "deciduous_broadleaf_forest",
+      "mixed_forest",
+      "closed_shrublands",
+      "open_shrublands",
+      "woody_savannas",
+      "savannas",
+      "grasslands",
+      "permanent_wetlands",
+      "croplands",
+      "urban_and_built_up",
+      "cropland_natural_vegetation_mosaic",
+      "permanent_snow_and_ice",
+      "barren_or_sparsely_vegetated",
+      "unclassified"
+    )
+  )
+  
+  process_landcover_csv <- function(file_path) {
+    df <- read_csv(file_path, locale = locale(encoding = "UTF-8"))
+    
+    hist_expanded <- df %>%
+      mutate(
+        clean_histogram = str_replace_all(histogram, "(\\d+)=", '"\\1":'),
+        clean_histogram = ifelse(!str_starts(clean_histogram, "\\{"), paste0("{", clean_histogram, "}"), clean_histogram),
+        hist_json = map(clean_histogram, ~fromJSON(.) %>% enframe(name = "code", value = "count"))
+      ) %>%
+      unnest(hist_json) %>%
+      mutate(count = as.numeric(count)) %>%
+      group_by(`system:index`, cd_ntrm) %>%
+      mutate(total = sum(count)) %>%
+      mutate(percent = (count / total) * 100) %>%
+      left_join(igbp_classes, by = "code") %>%
+      select(cd_ntrm, name, percent) %>%
+      pivot_wider(names_from = name, values_from = percent, values_fill = 0)
+    
+    return(hist_expanded)
+  }
+  
+  landcover_list <- map(all_years, process_landcover_csv)
+  
+  landcover_final <- bind_rows(
+    map2(landcover_list, all_years, ~ mutate(.x, year = str_extract(.y, "\\d{4}")))
+  )
+  
+  landcover_final <- landcover_final %>%
+    janitor::clean_names() %>%
+    ungroup() %>%
+    select(-system_index) %>%
+    rename(code_intermediate = cd_ntrm) %>%
+    mutate(year = as.integer(year)) %>%
+    mutate(across(-c(code_intermediate, year), ~replace_na(., 0))) %>%
+    rowwise() %>%
+    mutate(total_percent = sum(c_across(-c(code_intermediate, year)))) %>%
+    ungroup() %>%
+    mutate(across(-c(code_intermediate, year, total_percent), ~ ifelse(. < 0.001, 0, .))) %>%
+    mutate(across(-c(code_intermediate, year, total_percent), ~ . / 100))  # convert to share
+  
+  saveRDS(landcover_final, landcover_rds_path)
+  message("Saved processed landcover data to RDS.")
+}
+
+# plot shares over time for selected intermediate codes
+plot_codes <- c(1101, 1201, 1301)
+
+landcover_long <- landcover_final %>%
+  filter(code_intermediate %in% plot_codes) %>%
+  pivot_longer(
+    cols = -c(code_intermediate, year, total_percent),
+    names_to = "landcover_type",
+    values_to = "share"
+  )
+
+landcover_long_filtered <- landcover_long %>%
+  group_by(code_intermediate, landcover_type) %>%
+  filter(max(share) >= 0.01) %>%
+  ungroup()
+
+
+ggplot(landcover_long_filtered, aes(x = year, y = share, color = landcover_type)) +
+  geom_line() +
+  facet_wrap(~ code_intermediate) +
+  labs(
+    title = "Land Cover Shares Over Time",
+    y = "Share (0–1)",
+    x = "Year",
+    color = "Land Cover Type"
+  ) +
+  theme_minimal()
+
+
+# 4. Elevation ----------------------------------------------------------------------
+
+elevation <- read_csv(here("Elevation", "Raw", "Intermediate_Region_Elevation.csv"))
+
+elevation <- elevation %>%  
+  rename(code_intermediate = cd_ntrm)
+
 ##################################################################
+
+# WBDB data 
 
 wb <- read_excel(here("WBDB", "WB-DB.xlsx"))
 br <- wb %>% 
@@ -981,6 +1123,7 @@ ggplot(brwb, aes(x = year)) +
 
 ##############################################################
 
+# GADM
 
 
 iso3_code <- "BRA"
@@ -1020,122 +1163,182 @@ roi_vect <- vect(roi) %>%
 
 ###########################################################
 
+# 7980 OBSERVATIONS
+joined_df <- monthly_outages %>%
+  mutate(year = year(date))  # needed for land cover join
 
-# Setup directories
-dirs <- c("LandCover", "NTL", "Elevation")
-for (d in dirs) {
-  dir.create(d, showWarnings = FALSE)
-  dir.create(file.path(d, "Raw"), showWarnings = FALSE)
-}
+joined_df <- joined_df %>%
+  left_join(all_lightning, by = c("code_intermediate", "date"))
 
-ee <- import("ee")
-ee$Initialize()
+sapply(joined_df, function(x) sum(is.na(x)))
 
-bbox <- st_bbox(brazil)
-brazil_ee <- ee$Geometry$Rectangle(
-  coords = as.numeric(c(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"])),
-  proj = "EPSG:4326"
+joined_df <- joined_df %>%
+  left_join(era5_df, by = c("code_intermediate", "date"))
+
+sapply(joined_df, function(x) sum(is.na(x)))
+
+joined_df <- joined_df %>%
+  left_join(landcover_final, by = c("code_intermediate", "year"))
+
+sapply(joined_df, function(x) sum(is.na(x)))
+
+joined_df <- joined_df %>%
+  left_join(elevation, by = "code_intermediate")
+
+sapply(joined_df, function(x) sum(is.na(x)))
+
+
+saveRDS(joined_df, "joined_df.rds")
+
+#############################################
+
+joined_df$month <- factor(lubridate::month(joined_df$date),
+                          levels = 1:12,
+                          labels = month.name)
+
+joined_df <- joined_df %>%
+  select(-matches("\\.y$")) %>%  
+  rename_with(~ sub("\\.x$", "", .), ends_with(".x")) %>% 
+  rename(mean_elev = mean,
+         stdDev_elev = stdDev)
+
+
+feols(
+  outage_hrs ~ density + precip_mm + avg_temp + mean_elev + 
+    stdDev_elev + evergreen_broadleaf_forest + month,
+  data = joined_df, cluster = ~ code_intermediate
 )
 
-# LAND COVER (ESA WorldCover, annual)
-years <- 2017:2021
-for (yr in years) {
-  img <- ee$ImageCollection('ESA/WorldCover/v100')$
-    filter(ee$Filter$eq('year', yr))$
-    first()$
-    clip(brazil_ee)
-  
-  url <- img$getDownloadURL(list(
-    scale = 10,
-    region = brazil_ee$bounds()$getInfo()$coordinates,
-    format = "GEO_TIFF"
-  ))
-  
-  download.file(url, file.path("LandCover", "Raw", paste0("LandCover_", yr, ".tif")), mode = "wb")
-}
-
-# NIGHTTIME LIGHTS (VIIRS, monthly)
-for (d in months) {
-  start_date <- format(as.Date(d), "%Y-%m-%d")
-  end_date <- format(seq(d, length = 2, by = "1 month") - 1, "%Y-%m-%d")
-  
-  img <- ee$ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG')$
-    filterDate(start_date, end_date)$
-    first()$
-    select('avg_rad')$
-    clip(brazil_ee)
-  
-  url <- img$getDownloadURL(list(
-    scale = 500,
-    region = brazil_ee$bounds()$getInfo()$coordinates,
-    format = "GEO_TIFF"
-  ))
-  
-  download.file(url, file.path("NTL", "Raw", paste0("NTL_", format(d, "%Y%m"), ".tif")), mode = "wb")
-}
-
-
-# ELEVATION (SRTM, static)
-elev_img <- ee$Image('USGS/SRTMGL1_003')$
-  clip(brazil_ee)
-
-elev_url <- elev_img$getDownloadURL(list(
-  scale = 30,
-  region = brazil_ee$bounds()$getInfo()$coordinates,
-  format = "GEO_TIFF"
-))
-
-download.file(elev_url, file.path("Elevation", "Raw", "Elevation_SRTM.tif"), mode = "wb")
-
-
-# NIGHTTIME LIGHTS
-ntl_stack <- rast(list.files(file.path("NTL", "Raw"), pattern = "\\.tif$", full.names = TRUE))
-ntl_results <- exact_extract(
-  ntl_stack,
-  st_transform(intermediate_regions, crs(ntl_stack)),
-  fun = "mean",
-  append_cols = "code_intermediate"
+ols <- feols(
+  outage_hrs ~ density + precip_mm + avg_temp +
+    mean_elev + stdDev_elev +
+    power_mean + power_median + power_sd +
+    evergreen_broadleaf_forest + closed_shrublands +
+    deciduous_broadleaf_forest + croplands +
+    urban_and_built_up + evergreen_needleleaf_forest +
+    mixed_forest + barren_or_sparsely_vegetated +
+    month +
+    dewpoint_f + pressure_hpa + evap_mm + runoff_mm,
+  data = joined_df,
+  cluster = ~ code_intermediate
 )
-ntl_df <- ntl_results %>%
-  pivot_longer(-code_intermediate, names_to = "name", values_to = "ntl_value") %>%
+
+
+fe_model <- feols(
+  outage_hrs ~ density + precip_mm + avg_temp + year +
+    power_mean + power_median + power_sd +
+    evergreen_broadleaf_forest + closed_shrublands +
+    deciduous_broadleaf_forest + croplands +
+    urban_and_built_up + woody_savannas + savannas +
+    permanent_wetlands + grasslands + evergreen_needleleaf_forest +
+    mixed_forest + barren_or_sparsely_vegetated + open_shrublands +
+    cropland_natural_vegetation_mosaic + deciduous_needleleaf_forest +
+    month +
+    dewpoint_f + pressure_hpa + evap_mm + runoff_mm | code_intermediate,
+  data = joined_df,
+  cluster = ~ code_intermediate
+)
+
+fe_year_model <- feols(
+  outage_hrs ~ density + density*urban_and_built_up + precip_mm + avg_temp +
+    power_mean + power_median + power_sd +
+    evergreen_broadleaf_forest + closed_shrublands +
+    deciduous_broadleaf_forest + croplands +
+    urban_and_built_up + woody_savannas + savannas +
+    permanent_wetlands + grasslands + evergreen_needleleaf_forest +
+    mixed_forest + barren_or_sparsely_vegetated + open_shrublands +
+    cropland_natural_vegetation_mosaic + deciduous_needleleaf_forest +
+    month +
+    dewpoint_f + pressure_hpa + evap_mm + runoff_mm | code_intermediate + year,
+  data = joined_df,
+  cluster = ~ code_intermediate
+)
+
+plot_slopes(
+  model = fe_year_model,
+  variable = "density",
+  condition = "urban_and_built_up"
+)
+
+
+
+feols(
+  outage_hrs ~ density + precip_mm + avg_temp + mean_elev + 
+    stdDev_elev + evergreen_broadleaf_forest + month | code_intermediate,
+  data = joined_df,
+  cluster = ~ code_intermediate
+)
+
+feols(
+  outage_hrs ~ density + power_mean + precip_mm| code_intermediate + date,
+  data = joined_df
+)
+
+
+ggplot(joined_df, aes(x = density, y = outage_hrs)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Outage Hours vs. Density (Raw)",
+       x = "Population Density",
+       y = "Outage Hours per 1000 People")
+
+joined_df <- joined_df %>%
+  group_by(code_intermediate) %>%
   mutate(
-    date = ymd(paste0(str_extract(name, "\\d{6}"), "01")),
-    .keep = "unused"
+    outage_hrs_demeaned = outage_hrs - mean(outage_hrs, na.rm = TRUE),
+    density_demeaned = density - mean(density, na.rm = TRUE)
   ) %>%
-  select(date, code_intermediate, avg_ntl = ntl_value)
+  ungroup()
 
-# LAND COVER
-landcover_stack <- rast(list.files(file.path("LandCover", "Raw"), pattern = "\\.tif$", full.names = TRUE))
-lc_results <- exact_extract(
-  landcover_stack,
-  st_transform(intermediate_regions, crs(landcover_stack)),
-  fun = "mean",
-  append_cols = "code_intermediate"
-)
-lc_df <- lc_results %>%
-  pivot_longer(-code_intermediate, names_to = "name", values_to = "landcover_value") %>%
+ggplot(joined_df, aes(x = density_demeaned, y = outage_hrs_demeaned)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Within-Region Relationship (Fixed Effects)",
+       x = "Density (demeaned by region)",
+       y = "Outage Hours (demeaned by region)")
+
+joined_df <- joined_df %>%
+  mutate(urban_bin = cut(urban_and_built_up,
+                         breaks = quantile(urban_and_built_up, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE),
+                         labels = c("Low", "Mid-Low", "Mid-High", "High"),
+                         include.lowest = TRUE))
+
+ggplot(joined_df, aes(x = urban_bin, y = outage_hrs)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  labs(title = "Outage Hours by Urban Bin (Log Scale)",
+       x = "Urban Bin",
+       y = "Outage Hours per 1000 People (log10 scale)")
+
+
+
+joined_df %>%
+  filter(total_customer_outage_hrs > 0, density > 0) %>%  # remove 0s for log scale
+  ggplot(aes(x = density, y = total_customer_outage_hrs)) +
+  geom_point(alpha = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    x = "Lightning Strike Density (log)",
+    y = "Total Customer Outage Hours (log)",
+    title = "Log-Log Scatter: Lightning vs. Outage Hours"
+  ) +
+  theme_minimal()
+
+
+joined_df %>%
   mutate(
-    year = str_extract(name, "\\d{4}"),
-    date = ymd(paste0(year, "-01-01")),
-    .keep = "unused"
+    z_density = scale(density)[,1],
+    z_outage = scale(total_customer_outage_hrs)[,1]
   ) %>%
-  select(date, code_intermediate, avg_landcover = landcover_value)
-
-# ELEVATION
-elev_raster <- rast(list.files(file.path("Elevation", "Raw"), pattern = "\\.tif$", full.names = TRUE))
-elev_results <- exact_extract(
-  elev_raster,
-  st_transform(intermediate_regions, crs(elev_raster)),
-  fun = "mean",
-  append_cols = "code_intermediate"
-)
-elev_df <- elev_results %>%
-  select(code_intermediate, avg_elevation = mean)
-
-elev_df_expanded <- expand.grid(
-  code_intermediate = elev_df$code_intermediate,
-  date = ntl_df$date  # match monthly dates
-) %>%
-  left_join(elev_df, by = "code_intermediate")
+  ggplot(aes(x = z_density, y = z_outage)) +
+  geom_point(alpha = 0.5) +
+  labs(
+    x = "Standardized Lightning Density",
+    y = "Standardized Outage Hours",
+    title = "Standardized Scatter: Lightning vs. Outages"
+  ) +
+  geom_smooth()+
+  theme_minimal()
 
 
