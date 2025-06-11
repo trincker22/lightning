@@ -33,10 +33,7 @@ library(fixest)
 library(sidrar)
 library(reticulate)
 library(jsonlite)
-<<<<<<< HEAD
 library(marginaleffects)
-=======
->>>>>>> f2645f1daa1c9e78bf245c57f3630ba3dbb4abdb
 
 options(scipen=999)
 
