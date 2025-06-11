@@ -33,7 +33,10 @@ library(fixest)
 library(sidrar)
 library(reticulate)
 library(jsonlite)
+<<<<<<< HEAD
 library(marginaleffects)
+=======
+>>>>>>> f2645f1daa1c9e78bf245c57f3630ba3dbb4abdb
 
 options(scipen=999)
 
@@ -536,7 +539,6 @@ monthly_outages <- monthly_outages %>%
   mutate(date = as.Date(year_month)) %>%  
   select(-year_month)
 
-
 region_ids <- unique(monthly_outages$code_intermediate)
 month_seq <- seq.Date(
   from = as.Date("2017-01-01"),
@@ -561,7 +563,6 @@ monthly_outages <- full_grid %>%
     n_events = replace_na(n_events, 0),
     outage_hrs = if_else(is.na(outage_hrs), 0, outage_hrs)
   ) %>% filter(!is.na(code_intermediate))
-
 
 ##################################################################
 
@@ -844,14 +845,16 @@ joined_df <- joined_df %>%
   left_join(rainfall_df, by = c("code_intermediate", "date"))
 
 
+
 # 2. Weather  -----------------------------------------------------------
 
 ee <- import("ee")
 ee$Initialize()
 
 
-dir.create("Temp", showWarnings = FALSE)
-dir.create("Temp/TIFs", showWarnings = FALSE)
+# 1. Setup 
+if (!dir.exists("Temp")) dir.create("Temp")
+if (!dir.exists(file.path("Temp", "TIFs"))) dir.create(file.path("Temp", "TIFs"))
 era5_df_path <- file.path("Temp", "era5_df.rds")
 
 
@@ -922,6 +925,19 @@ all_dfs <- map_dfr(dates, function(date) {
     "total_evaporation_sum",
     "runoff_sum"
   )
+
+})
+
+# 3. Process Data
+temp_df_path <- file.path("Temp", "temp_df.rds")
+
+if (file.exists(temp_df_path)) {
+  message("Loading saved temp_df...")
+  temp_df <- readRDS(temp_df_path)
+} else {
+  message("Processing raw .tif files...")
+  # Load all downloaded files
+  temp_stack <- rast(list.files(file.path("Temp", "TIFs"), pattern = "\\.tif$", full.names = TRUE))
   
   # Extract zonal means
   extracted <- exact_extract(
@@ -1325,12 +1341,6 @@ joined_df %>%
   ) +
   theme_minimal()
 
-
-joined_df %>%
-  mutate(
-    z_density = scale(density)[,1],
-    z_outage = scale(total_customer_outage_hrs)[,1]
-  ) %>%
   ggplot(aes(x = z_density, y = z_outage)) +
   geom_point(alpha = 0.5) +
   labs(
