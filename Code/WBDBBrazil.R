@@ -847,77 +847,30 @@ joined_df <- joined_df %>%
 
 
 # 2. Weather  -----------------------------------------------------------
-
 ee <- import("ee")
 ee$Initialize()
 
-
-# 1. Setup 
+# Setup 
 if (!dir.exists("Temp")) dir.create("Temp")
 if (!dir.exists(file.path("Temp", "TIFs"))) dir.create(file.path("Temp", "TIFs"))
-era5_df_path <- file.path("Temp", "era5_df.rds")
 
+era5_df_path <- file.path("Temp", "era5_df.rds")
 
 if (file.exists(era5_df_path)) {
   message("Loading ERA5 data from file...")
   era5_df <- readRDS(era5_df_path)
   
 } else {
-
-bbox <- st_bbox(brazil)
-brazil_ee <- ee$Geometry$Rectangle(
-  coords = as.numeric(c(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"])),
-  proj = "EPSG:4326"
-)
-
-dates <- seq(as.Date("2017-01-01"), as.Date("2021-12-01"), by = "month")
-
-bands <- c(
-  "temperature_2m",
-  "total_precipitation_sum",
-  "dewpoint_temperature_2m",
-  "surface_pressure",
-  "total_evaporation_sum",
-  "runoff_sum"
-)
-
-# Download function for multi-band TIFFs
-download_era5 <- function(date, out_dir = "Temp/TIFs") {
-  fname <- paste0(format(date, "%Y%m"), ".tif")
-  tif_file <- file.path(out_dir, fname)
-  if (file.exists(tif_file)) return(tif_file)
+  # Geometry setup
+  bbox <- st_bbox(brazil)
+  brazil_ee <- ee$Geometry$Rectangle(
+    coords = as.numeric(c(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"])),
+    proj = "EPSG:4326"
+  )
   
-  img <- ee$ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')$
-    filter(ee$Filter$date(format(date, "%Y-%m-%d")))$
-    first()$
-    select(bands)$
-    clip(brazil_ee)
+  dates <- seq(as.Date("2017-01-01"), as.Date("2021-12-01"), by = "month")
   
-  url <- img$getDownloadURL(list(
-    scale = 10000,
-    region = brazil_ee$bounds()$getInfo()$coordinates,
-    format = "GEO_TIFF",
-    filePerBand = FALSE
-  ))
-  
-  tryCatch({
-    download.file(url, tif_file, mode = "wb")
-    message("Downloaded:", basename(tif_file))
-  }, error = function(e) {
-    message("Download failed for ", format(date, "%Y-%m"))
-    return(NULL)
-  })
-  
-  return(tif_file)
-}
-# Loop: download and extract all months
-all_dfs <- map_dfr(dates, function(date) {
-  tif_path <- download_era5(date)
-  if (is.null(tif_path)) return(NULL)
-  
-  # Load raster and manually assign correct band names
-  r <- rast(tif_path)
-  names(r) <- c(
+  bands <- c(
     "temperature_2m",
     "total_precipitation_sum",
     "dewpoint_temperature_2m",
@@ -925,59 +878,74 @@ all_dfs <- map_dfr(dates, function(date) {
     "total_evaporation_sum",
     "runoff_sum"
   )
-
-})
-
-# 3. Process Data
-temp_df_path <- file.path("Temp", "temp_df.rds")
-
-if (file.exists(temp_df_path)) {
-  message("Loading saved temp_df...")
-  temp_df <- readRDS(temp_df_path)
-} else {
-  message("Processing raw .tif files...")
-  # Load all downloaded files
-  temp_stack <- rast(list.files(file.path("Temp", "TIFs"), pattern = "\\.tif$", full.names = TRUE))
   
-  # Extract zonal means
-  extracted <- exact_extract(
-    r,
-    st_transform(intermediate_regions, crs(r)),
-    fun = "mean",
-    append_cols = "code_intermediate"
-  ) %>%
-    pivot_longer(
-      cols = -code_intermediate,
-      names_to = "variable",
-      values_to = "value"
+  # Download function
+  download_era5 <- function(date, out_dir = "Temp/TIFs") {
+    fname <- paste0(format(date, "%Y%m"), ".tif")
+    tif_file <- file.path(out_dir, fname)
+    if (file.exists(tif_file)) return(tif_file)
+    
+    img <- ee$ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR')$
+      filter(ee$Filter$date(format(date, "%Y-%m-%d")))$
+      first()$
+      select(bands)$
+      clip(brazil_ee)
+    
+    url <- img$getDownloadURL(list(
+      scale = 10000,
+      region = brazil_ee$bounds()$getInfo()$coordinates,
+      format = "GEO_TIFF",
+      filePerBand = FALSE
+    ))
+    
+    tryCatch({
+      download.file(url, tif_file, mode = "wb")
+      message("Downloaded: ", basename(tif_file))
+      return(tif_file)
+    }, error = function(e) {
+      message("Download failed for ", format(date, "%Y-%m"))
+      return(NULL)
+    })
+  }
+  
+  # Download and extract
+  all_dfs <- map_dfr(dates, function(date) {
+    tif_path <- download_era5(date)
+    if (is.null(tif_path)) return(NULL)
+    
+    r <- rast(tif_path)
+    names(r) <- bands
+    
+    extracted <- exact_extract(
+      r,
+      st_transform(intermediate_regions, crs(r)),
+      fun = "mean",
+      append_cols = "code_intermediate"
     ) %>%
-    mutate(
-      variable = str_remove(variable, "^mean\\."),
-      date = date
-    )
+      pivot_longer(-code_intermediate, names_to = "variable", values_to = "value") %>%
+      mutate(
+        date = date
+      )
+    
+    return(extracted)
+  })
   
-  return(extracted)
-})
-
-
-# Tidy to wide and apply unit conversions
-era5_df <- all_dfs %>%
-  pivot_wider(names_from = variable, values_from = value) %>%
-  mutate(
-    avg_temp     = (temperature_2m - 273.15) * 9/5 + 32,
-    precip_mm    = total_precipitation_sum * 1000,
-    dewpoint_f   = (dewpoint_temperature_2m - 273.15) * 9/5 + 32,
-    pressure_hpa = surface_pressure / 100,
-    evap_mm      = total_evaporation_sum * 1000,
-    runoff_mm    = runoff_sum * 1000
-  ) %>%
-  select(code_intermediate, date, avg_temp, precip_mm, dewpoint_f, pressure_hpa, evap_mm, runoff_mm) %>%
-  arrange(code_intermediate, date)
-
-
-saveRDS(era5_df, file.path("Temp", "era5_df.rds"))
-
-message("ERA5 data saved to: ", era5_df_path)
+  # Clean and convert units
+  era5_df <- all_dfs %>%
+    pivot_wider(names_from = variable, values_from = value) %>%
+    mutate(
+      avg_temp     = (temperature_2m - 273.15) * 9/5 + 32,
+      precip_mm    = total_precipitation_sum * 1000,
+      dewpoint_f   = (dewpoint_temperature_2m - 273.15) * 9/5 + 32,
+      pressure_hpa = surface_pressure / 100,
+      evap_mm      = total_evaporation_sum * 1000,
+      runoff_mm    = runoff_sum * 1000
+    ) %>%
+    select(code_intermediate, date, avg_temp, precip_mm, dewpoint_f, pressure_hpa, evap_mm, runoff_mm) %>%
+    arrange(code_intermediate, date)
+  
+  saveRDS(era5_df, era5_df_path)
+  message("ERA5 data saved to: ", era5_df_path)
 }
 
 
