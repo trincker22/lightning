@@ -522,33 +522,38 @@ pop_intermediate <- pop_muni %>%
 conj_int <- conj_int %>%  
   left_join(pop_intermediate, join_by(code_intermediate))
 
-
 monthly_outages <- monthly_outages %>%
   left_join(
     conj_int %>% select(code_intermediate, int_pop_2020) %>% distinct(),
     by = "code_intermediate"
   ) %>% 
-  mutate( outage_hrs = total_customer_outage_hrs*1000/int_pop_2020
-  ) %>%  
-  select(-int_pop_2020)
+  mutate(outage_hrs = total_customer_outage_hrs * 1000 / int_pop_2020)
+
+# unit of outage_hrs is OUTAGE HOURS PER 1000 CUSTOMERS PER MONTH-INT_REGION 
+
+
+
+
+####### Creating full_grid
 
 monthly_outages <- monthly_outages %>%
   mutate(date = as.Date(year_month)) %>%  
   select(-year_month)
 
-region_ids <- unique(monthly_outages$code_intermediate)
+region_ids <- monthly_outages %>%
+  filter(!is.na(code_intermediate)) %>%
+  distinct(code_intermediate)
+
 month_seq <- seq.Date(
   from = as.Date("2017-01-01"),
   to = max(monthly_outages$date),
   by = "month"
 )
 
-
 full_grid <- expand_grid(
-  code_intermediate = region_ids,
+  code_intermediate = region_ids$code_intermediate,
   date = month_seq
 )
-
 
 monthly_outages <- full_grid %>%
   left_join(monthly_outages, by = c("code_intermediate", "date")) %>%
@@ -560,6 +565,8 @@ monthly_outages <- full_grid %>%
     n_events = replace_na(n_events, 0),
     outage_hrs = if_else(is.na(outage_hrs), 0, outage_hrs)
   ) %>% filter(!is.na(code_intermediate))
+
+dim(monthly_outages)
 
 ##################################################################
 
@@ -782,12 +789,15 @@ plot_power_mean(lightning_sf, 2021, 7)
 #############################################################
 
 
-
+# this is actually now obsolete because era5 contains rainfall and other weather data. 
 # 1. Rainfall-----------------------------------------------------------
 
 
 dir.create("Rainfall", showWarnings = F, recursive = T)
 dir.create("Rainfall/TIFs", showWarnings = FALSE, recursive = TRUE)
+
+
+if (!file.exists("Rainfall/rainfall_df.rds")) {
 
 
 download_chirps_month <- function(year, month) {
@@ -835,12 +845,12 @@ for (file in tif_files) {
 }
 
 rainfall_df <- rainfall_df %>%
-  mutate(precip_mm = ifelse(precip_mm < 0, NA, precip_mm))
+  mutate(precip_mm = ifelse(precip_mm < 0, NA, precip_mm)) 
 
-
-joined_df <- joined_df %>%
-  left_join(rainfall_df, by = c("code_intermediate", "date"))
-
+saveRDS(rainfall_df, here("Rainfall", "rainfall_df.rds")) } 
+else { 
+  rainfall_df <- readRDS(here("Rainfall", "rainfall_df.rds"))
+  }
 
 
 # 2. Weather  -----------------------------------------------------------
@@ -854,7 +864,7 @@ if (!dir.exists(file.path("Temp", "TIFs"))) dir.create(file.path("Temp", "TIFs")
 era5_df_path <- file.path("Temp", "era5_df.rds")
 
 if (file.exists(era5_df_path)) {
-  message("Loading ERA5 data from file...")
+  message("Loading ERA5 data from file.")
   era5_df <- readRDS(era5_df_path)
   
 } else {
@@ -955,7 +965,7 @@ if (file.exists(landcover_rds_path)) {
   message("Loading processed landcover data from RDS...")
   landcover_final <- readRDS(landcover_rds_path)
 } else {
-  message("Processing landcover data...")
+  message("Processing landcover data.")
   
   landcover_dir <- here("LandCover", "Raw")
   all_years <- list.files(path = landcover_dir, pattern = "Brazil_LandCover_\\d{4}_summary.csv", full.names = TRUE)
@@ -1061,95 +1071,22 @@ ggplot(landcover_long_filtered, aes(x = year, y = share, color = landcover_type)
 elevation <- read_csv(here("Elevation", "Raw", "Intermediate_Region_Elevation.csv"))
 
 elevation <- elevation %>%  
-  rename(code_intermediate = cd_ntrm)
+  rename(code_intermediate = cd_ntrm, 
+         mean_elev = mean,
+         stdDev_elev = stdDev)
 
-##################################################################
+##################################################################################
 
-# WBDB data 
-
-wb <- read_excel(here("WBDB", "WB-DB.xlsx"))
-br <- wb %>% 
-  filter(wb$`Economy Name` =="Brazil")
-
-saidi <- br %>% 
-  filter(br$`Indicator ID` == "WB.DB.58" |
-           br$`Indicator ID` == "WB.DB.55" | 
-           br$`Indicator ID` == "WB.DB.56" |
-           br$`Indicator ID` == "WB.DB.57" )
-
-# Getting electricity : System average interruption duration index (SAIDI) (DB16-20 methodology)
-# Getting electricity : System average interruption frequency index (SAIFI) (DB16-20 methodology)
-# Getting electricity : Minimum outage time (in minutes)  (DB16-20 methodology)
-# Getting electricity : Price of electricity (US cents per kWh) (DB16-20 methodology)
-
-
-brwb <- data.frame(
-  year = as.numeric(colnames(saidi)[20:25]), 
-  SAIDI = as.numeric(saidi[1, 20:25]),
-  SAIFI = as.numeric(saidi[2, 20:25]), 
-  minout = as.numeric(saidi[3, 20:25]), 
-  price = as.numeric(saidi[4, 20:25])
-)
-
-ggplot(brwb, aes(x = year)) +
-  geom_line(aes(y = SAIDI, color = "SAIDI"), linewidth = 1) +
-  geom_line(aes(y = SAIFI, color = "SAIFI"), linewidth = 1) +
-  geom_line(aes(y = minout, color = "Minimum Outage Duration"), linewidth = 1) +
-  geom_line(aes(y = price, color = "Avg Price--US cents per kWh"), linewidth = 1) +
-  labs(title = "Utility Performance Indicators",
-       y = "Value",
-       color = "Indicator") +
-  theme_minimal()
-
-
-##############################################################
-
-# GADM
-
-
-iso3_code <- "BRA"
-gadm_dir <- here("GADM")
-
-
-for (i in 0:2) {
-  file_check <- file.path(gadm_dir, "gadm", paste0("gadm41_", iso3_code, "_", i, "_pk.rds"))
-  
-  if (!file.exists(file_check)) {
-    message("Downloading GADM level ", i, "...")
-    gadm(iso3_code, level = i, path = gadm_dir)
-  } else {
-    message("GADM level ", i, " already exists — skipping download.")
-  }
-}
-
-
-load_gadm <- function(i) {
-  list.files(
-    path = file.path(gadm_dir, "gadm"),
-    pattern = paste0("_", i, "_pk\\.rds$"),
-    full.names = TRUE
-  ) %>%
-    map(~ readRDS(.x) %>% st_as_sf()) %>%
-    list_rbind()
-}
-
-
-roi <- load_gadm(1)
-brazil <- load_gadm(0) %>%
-  st_transform(crs = 4326)
-
-roi_vect <- vect(roi) %>%
-  project("EPSG:4326")  
-
-
-###########################################################
+names(joined_df)
 
 # 7980 OBSERVATIONS
 joined_df <- monthly_outages %>%
   mutate(year = year(date))  # needed for land cover join
 
 joined_df <- joined_df %>%
-  left_join(all_lightning, by = c("code_intermediate", "date"))
+  left_join(all_lightning %>%  
+              select(-c(power_mean, power_median, power_sd)),
+            by = c("code_intermediate", "date"))
 
 sapply(joined_df, function(x) sum(is.na(x)))
 
@@ -1159,7 +1096,8 @@ joined_df <- joined_df %>%
 sapply(joined_df, function(x) sum(is.na(x)))
 
 joined_df <- joined_df %>%
-  left_join(landcover_final, by = c("code_intermediate", "year"))
+  left_join(landcover_final %>%  
+              select(-total_percent), by = c("code_intermediate", "year"))
 
 sapply(joined_df, function(x) sum(is.na(x)))
 
@@ -1168,20 +1106,24 @@ joined_df <- joined_df %>%
 
 sapply(joined_df, function(x) sum(is.na(x)))
 
-
-saveRDS(joined_df, "joined_df.rds")
-
-#############################################
-
 joined_df$month <- factor(lubridate::month(joined_df$date),
                           levels = 1:12,
                           labels = month.name)
 
 joined_df <- joined_df %>%
   select(-matches("\\.y$")) %>%  
-  rename_with(~ sub("\\.x$", "", .), ends_with(".x")) %>% 
-  rename(mean_elev = mean,
-         stdDev_elev = stdDev)
+  rename_with(~ sub("\\.x$", "", .), ends_with(".x"))
+
+sapply(joined_df, function(x) sum(is.na(x)))
+
+
+saveRDS(joined_df, "joined_df.rds")
+
+
+readRDS("joined_df.rds")
+
+#############################################
+
 
 
 feols(
@@ -1193,8 +1135,7 @@ feols(
 ols <- feols(
   outage_hrs ~ density + precip_mm + avg_temp +
     mean_elev + stdDev_elev +
-    power_mean + power_median + power_sd +
-    evergreen_broadleaf_forest + closed_shrublands +
+  evergreen_broadleaf_forest + closed_shrublands +
     deciduous_broadleaf_forest + croplands +
     urban_and_built_up + evergreen_needleleaf_forest +
     mixed_forest + barren_or_sparsely_vegetated +
@@ -1204,10 +1145,9 @@ ols <- feols(
   cluster = ~ code_intermediate
 )
 
-
+ols
 fe_model <- feols(
   outage_hrs ~ density + precip_mm + avg_temp + year +
-    power_mean + power_median + power_sd +
     evergreen_broadleaf_forest + closed_shrublands +
     deciduous_broadleaf_forest + croplands +
     urban_and_built_up + woody_savannas + savannas +
@@ -1220,9 +1160,10 @@ fe_model <- feols(
   cluster = ~ code_intermediate
 )
 
+fe_model
+
 fe_year_model <- feols(
   outage_hrs ~ density + density*urban_and_built_up + precip_mm + avg_temp +
-    power_mean + power_median + power_sd +
     evergreen_broadleaf_forest + closed_shrublands +
     deciduous_broadleaf_forest + croplands +
     urban_and_built_up + woody_savannas + savannas +
@@ -1234,6 +1175,8 @@ fe_year_model <- feols(
   data = joined_df,
   cluster = ~ code_intermediate
 )
+
+fe_year_model
 
 plot_slopes(
   model = fe_year_model,
@@ -1315,5 +1258,87 @@ joined_df %>%
   ) +
   geom_smooth()+
   theme_minimal()
-
-
+  
+  
+  
+  ##################################################################
+  
+  # WBDB data 
+  
+  wb <- read_excel(here("WBDB", "WB-DB.xlsx"))
+  br <- wb %>% 
+    filter(wb$`Economy Name` =="Brazil")
+  
+  saidi <- br %>% 
+    filter(br$`Indicator ID` == "WB.DB.58" |
+             br$`Indicator ID` == "WB.DB.55" | 
+             br$`Indicator ID` == "WB.DB.56" |
+             br$`Indicator ID` == "WB.DB.57" )
+  
+  # Getting electricity : System average interruption duration index (SAIDI) (DB16-20 methodology)
+  # Getting electricity : System average interruption frequency index (SAIFI) (DB16-20 methodology)
+  # Getting electricity : Minimum outage time (in minutes)  (DB16-20 methodology)
+  # Getting electricity : Price of electricity (US cents per kWh) (DB16-20 methodology)
+  
+  
+  brwb <- data.frame(
+    year = as.numeric(colnames(saidi)[20:25]), 
+    SAIDI = as.numeric(saidi[1, 20:25]),
+    SAIFI = as.numeric(saidi[2, 20:25]), 
+    minout = as.numeric(saidi[3, 20:25]), 
+    price = as.numeric(saidi[4, 20:25])
+  )
+  
+  ggplot(brwb, aes(x = year)) +
+    geom_line(aes(y = SAIDI, color = "SAIDI"), linewidth = 1) +
+    geom_line(aes(y = SAIFI, color = "SAIFI"), linewidth = 1) +
+    geom_line(aes(y = minout, color = "Minimum Outage Duration"), linewidth = 1) +
+    geom_line(aes(y = price, color = "Avg Price--US cents per kWh"), linewidth = 1) +
+    labs(title = "Utility Performance Indicators",
+         y = "Value",
+         color = "Indicator") +
+    theme_minimal()
+  
+  
+  ##############################################################
+  
+  # GADM
+  
+  
+  iso3_code <- "BRA"
+  gadm_dir <- here("GADM")
+  
+  
+  for (i in 0:2) {
+    file_check <- file.path(gadm_dir, "gadm", paste0("gadm41_", iso3_code, "_", i, "_pk.rds"))
+    
+    if (!file.exists(file_check)) {
+      message("Downloading GADM level ", i, "...")
+      gadm(iso3_code, level = i, path = gadm_dir)
+    } else {
+      message("GADM level ", i, " already exists — skipping download.")
+    }
+  }
+  
+  
+  load_gadm <- function(i) {
+    list.files(
+      path = file.path(gadm_dir, "gadm"),
+      pattern = paste0("_", i, "_pk\\.rds$"),
+      full.names = TRUE
+    ) %>%
+      map(~ readRDS(.x) %>% st_as_sf()) %>%
+      list_rbind()
+  }
+  
+  
+  roi <- load_gadm(1)
+  brazil <- load_gadm(0) %>%
+    st_transform(crs = 4326)
+  
+  roi_vect <- vect(roi) %>%
+    project("EPSG:4326")  
+  
+  
+  ###########################################################
+  
