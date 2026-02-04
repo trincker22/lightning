@@ -1,0 +1,482 @@
+---
+title: "POF 2017-2018 Household Appliances and Electricity Access"
+author: "Codex"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+---
+
+## Setup
+
+This document reproduces the full POF 2017–2018 microdata workflow: download, translate the fixed-width files into English, construct a household-level panel, and then summarize appliance ownership along income, household size, and electricity-availability dimensions.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(file.path("..", "..")))
+root_dir <- normalizePath(file.path("..", ".."))
+setwd(root_dir)
+library(readr)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(janitor)
+library(arrow)
+library(ggplot2)
+library(geobr)
+library(sf)
+library(scales)
+library(broom)
+library(tidyr)
+library(tibble)
+
+BASE_DIR <- file.path("data", "pof2017_2018")
+ZIP_DIR <- file.path(BASE_DIR, "zips")
+DATA_DIR <- file.path(BASE_DIR, "dados")
+DOC_DIR <- file.path(BASE_DIR, "documentacao")
+PARQ_DIR <- file.path(BASE_DIR, "parquet")
+TRANS_DIR <- file.path(BASE_DIR, "translations")
+PROGRAMS_DIR <- file.path(BASE_DIR, "programas_leitura")
+ANALYSIS_DIR <- file.path(BASE_DIR, "analysis")
+REPORTS_DIR <- file.path(ANALYSIS_DIR, "reports")
+
+mkdirs <- function(...) {
+  for (d in list(...)) {
+    if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+  }
+}
+
+mkdirs(BASE_DIR, ZIP_DIR, DATA_DIR, DOC_DIR, PARQ_DIR, PROGRAMS_DIR, ANALYSIS_DIR, REPORTS_DIR)
+
+download_urls <- list(
+  Dados = "https://ftp.ibge.gov.br/Orcamentos_Familiares/Pesquisa_de_Orcamentos_Familiares_2017_2018/Microdados/Dados_20230713.zip",
+  Documentacao = "https://ftp.ibge.gov.br/Orcamentos_Familiares/Pesquisa_de_Orcamentos_Familiares_2017_2018/Microdados/Documentacao_20230713.zip",
+  Programas = "https://ftp.ibge.gov.br/Orcamentos_Familiares/Pesquisa_de_Orcamentos_Familiares_2017_2018/Microdados/Programas_de_Leitura_20230713.zip"
+)
+
+safe_download <- function(url, dest) {
+  if (file.exists(dest)) return(invisible(dest))
+  message("Downloading ", basename(dest))
+  download.file(url, dest, mode = "wb", quiet = FALSE)
+}
+
+safe_unzip <- function(zip_path, out_dir) {
+  if (!file.exists(zip_path)) stop("Missing ", zip_path)
+  if (dir.exists(out_dir) && length(list.files(out_dir, recursive = TRUE)) > 0) {
+    return(invisible(out_dir))
+  }
+  tryCatch({
+    unzip(zip_path, exdir = out_dir)
+  }, error = function(e) {
+    system2("ditto", c("-x", "-k", shQuote(zip_path), shQuote(out_dir)))
+  })
+}
+for (name in names(download_urls)) {
+  dest <- file.path(ZIP_DIR, paste0(name, "_20230713.zip"))
+  safe_download(download_urls[[name]], dest)
+  target_dir <- switch(name,
+    Dados = DATA_DIR,
+    Documentacao = DOC_DIR,
+    Programas = PROGRAMS_DIR
+  )
+  safe_unzip(dest, target_dir)
+}
+
+dict_files <- list.files(DOC_DIR, pattern = "Dicion", full.names = TRUE, ignore.case = TRUE)
+if (length(dict_files) == 0) stop("Dictionary file missing in documentacao.")
+dict_path <- dict_files[[1]]
+
+parse_dict_sheet <- function(sheet) {
+  raw <- read_excel(dict_path, sheet = sheet, col_names = FALSE)
+  header_idx <- which(raw[[1]] == "Posição Inicial")[1]
+  if (is.na(header_idx)) return(tibble())
+  data <- raw[(header_idx + 1):nrow(raw), 1:6]
+  names(data) <- c("posicao", "tamanho", "decimais", "codigo_variavel", "descricao", "categoria")
+  data %>%
+    mutate(
+      codigo_variavel = str_trim(as.character(codigo_variavel)),
+      descricao = str_trim(as.character(descricao))
+    ) %>%
+    filter(!is.na(codigo_variavel), codigo_variavel != "")
+}
+
+dictionary <- bind_rows(lapply(excel_sheets(dict_path), parse_dict_sheet))
+
+var_labels_path <- file.path(TRANS_DIR, "var_labels_pt_en.csv")
+translation_lookup <- read_csv(var_labels_path, show_col_types = FALSE) %>%
+  rename(descricao_pt = pt, descricao_en = en)
+
+manual_translations <- c(
+  UF = "state_uf",
+  ESTRATO_POF = "poff_strata",
+  TIPO_SITUACAO_REG = "household_type",
+  COD_UPA = "psu_code",
+  NUM_DOM = "household_number",
+  NUM_UC = "consumption_unit",
+  COD_INFORMANTE = "informant_id",
+  QUADRO = "panel_code",
+  SEQ = "panel_sequence",
+  V9001 = "product_code",
+  V9005 = "quantity",
+  V9002 = "acquisition_form",
+  V1404 = "product_condition",
+  V9012 = "last_acquisition_year"
+)
+
+var_map <- dictionary %>%
+  left_join(translation_lookup, by = c("descricao" = "descricao_pt")) %>%
+  mutate(
+    descricao_en = ifelse(is.na(descricao_en), descricao, descricao_en),
+    var_name_en = janitor::make_clean_names(descricao_en, replace = c("\u00b5" = "micro"))
+  ) %>%
+  filter(!is.na(var_name_en)) %>%
+  distinct(codigo_variavel, .keep_all = TRUE)
+
+rename_map <- c(
+  setNames(var_map$var_name_en, var_map$codigo_variavel),
+  manual_translations
+)
+
+rename_map <- rename_map[!duplicated(names(rename_map))]
+
+fwf_specs <- list(
+  household = list(
+    file = "DOMICILIO.txt",
+    widths = c(2,4,1,9,2,1,1,1,1,2,1,1,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,14,14,1),
+    col_names = c("UF", "ESTRATO_POF", "TIPO_SITUACAO_REG", "COD_UPA", "NUM_DOM", "V0201", "V0202", "V0203",
+                  "V0204", "V0205", "V0206", "V0207", "V0208", "V0209", "V02101", "V02102", "V02103", "V02104",
+                  "V02105", "V02111", "V02112", "V02113", "V0212", "V0213", "V02141", "V02142", "V0215",
+                  "V02161", "V02162", "V02163", "V02164", "V0217", "V0219", "V0220", "V0221", "PESO",
+                  "PESO_FINAL", "V6199")
+  ),
+  resident = list(
+    file = "MORADOR.txt",
+    widths = c(2,4,1,9,2,1,2,2,1,2,2,4,3,1,1,1,1,1,2,1,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,1,2,1,1,2,1,1,1,2,1,2,14,14,10,1,20,20,20,20),
+    col_names = c("UF","ESTRATO_POF","TIPO_SITUACAO_REG","COD_UPA","NUM_DOM","NUM_UC","COD_INFORMANTE","V0306","V0401","V04021","V04022","V04023","V0403","V0404","V0405","V0406","V0407","V0408","V0409","V0410","V0411","V0412","V0413","V0414","V0415","V0416","V041711","V041712","V041721","V041722","V041731","V041732","V041741","V041742","V0418","V0419","V0420","V0421","V0422","V0423","V0424","V0425","V0426","V0427","V0428","V0429","V0430","ANOS_ESTUDO","PESO","PESO_FINAL","RENDA_TOTAL","NIVEL_INSTRUCAO","RENDA_DISP_PC","RENDA_MONET_PC","RENDA_NAO_MONET_PC","DEDUCAO_PC")
+  ),
+  inventory = list(
+    file = "INVENTARIO.txt",
+    widths = c(2,4,1,9,2,1,2,2,7,2,2,4,1,14,14,10),
+    col_names = c("UF","ESTRATO_POF","TIPO_SITUACAO_REG","COD_UPA","NUM_DOM","NUM_UC","QUADRO","SEQ","V9001","V9005","V9002","V1404","V9012","PESO","PESO_FINAL","RENDA_TOTAL")
+  ),
+  labor_income = list(
+    file = "RENDIMENTO_TRABALHO.txt",
+    widths = c(2,4,1,9,2,1,2,2,1,1,7,1,1,1,1,1,1,7,7,7,7,2,2,3,1,12,10,10,10,10,1,1,14,14,10,4,5),
+    col_names = c("UF","ESTRATO_POF","TIPO_SITUACAO_REG","COD_UPA","NUM_DOM","NUM_UC","COD_INFORMANTE","QUADRO","SUB_QUADRO","SEQ","V9001","V5302","V53021","V5303","V5304","V5305","V5307","V8500","V531112","V531122","V531132","V9010","V9011","V5314","V5315","DEFLATOR","V8500_DEFLA","V531112_DEFLA","V531122_DEFLA","V531132_DEFLA","COD_IMPUT_VALOR","FATOR_ANUALIZACAO","PESO","PESO_FINAL","RENDA_TOTAL","V53011","V53061")
+  ),
+  other_income = list(
+    file = "OUTROS_RENDIMENTOS.txt",
+    widths = c(2,4,1,9,2,1,2,2,2,7,10,10,2,2,12,10,10,1,1,14,14,10),
+    col_names = c("UF","ESTRATO_POF","TIPO_SITUACAO_REG","COD_UPA","NUM_DOM","NUM_UC","COD_INFORMANTE","QUADRO","SEQ","V9001","V8500","V8501","V9010","V9011","DEFLATOR","V8500_DEFLA","V8501_DEFLA","COD_IMPUT_VALOR","FATOR_ANUALIZACAO","PESO","PESO_FINAL","RENDA_TOTAL")
+  ),
+  living_conditions = list(
+    file = "CONDICOES_VIDA.txt",
+    widths = c(
+      2, 4, 1, 9, 2, 1, 2, 1, 6, 5,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 14, 14, 10
+    ),
+    col_names = c("UF","ESTRATO_POF","TIPO_SITUACAO_REG","COD_UPA","NUM_DOM","NUM_UC","COD_INFORMANTE","V6101","V6102","V6103","V61041","V61042","V61043","V61044","V61045","V61046","V61051","V61052","V61053","V61054","V61055","V61056","V61057","V61058","V61061","V61062","V61063","V61064","V61065","V61066","V61067","V61068","V61069","V610610","V610611","V61071","V61072","V61073","V6108","V6109","V6110","V6111","V6112","V6113","V6114","V6115","V6116","V6117","V6118","V6119","V6120","V6121","PESO","PESO_FINAL","RENDA_TOTAL")
+  )
+)
+
+read_fwf_with_names <- function(spec) {
+  read_fwf(
+    file.path(DATA_DIR, spec$file),
+    fwf_widths(spec$widths, spec$col_names),
+    col_types = cols(.default = "c"),
+    na = c("", " "),
+    progress = FALSE
+  )
+}
+
+rename_to_english <- function(df) {
+  matcher <- function(cols) {
+    vapply(cols, function(col) {
+      if (col %in% names(rename_map)) rename_map[[col]] else col
+    }, FUN.VALUE = character(1))
+  }
+  df %>%
+    rename_with(matcher) %>%
+    rename_with(janitor::make_clean_names)
+}
+
+unlink(PARQ_DIR, recursive = TRUE)
+mkdirs(PARQ_DIR)
+
+for (unit in names(fwf_specs)) {
+  spec <- fwf_specs[[unit]]
+  df <- read_fwf_with_names(spec)
+  df_en <- rename_to_english(df)
+  write_parquet(df_en, file.path(PARQ_DIR, paste0(unit, ".parquet")))
+}
+```
+
+This chunk downloads the microdata and documentation, translates the dictionary entries via the Portuguese-to-English maps, and writes six Parquet datasets that we will reuse below.
+
+## Household panel
+
+```{r household-panel}
+household <- read_parquet(file.path(PARQ_DIR, "household.parquet"))
+resident <- read_parquet(file.path(PARQ_DIR, "resident.parquet"))
+inventory <- read_parquet(file.path(PARQ_DIR, "inventory.parquet"))
+
+rename_keys <- function(df) {
+  key_map <- c(
+    primary_sampling_unit_code_uf_2_sequential_number_6_dv_1_the_first_2_positions_represent_the_state_code = "psu_code",
+    household_number_sequential_code_assigned_to_each_selected_household_within_each_psu = "household_number",
+    consumption_unit_cu_number_within_the_household_1_to_total_c_us = "consumption_unit"
+  )
+  available <- key_map[key_map %in% names(df)]
+  if (length(available) == 0) return(df)
+  rename(df, !!!available)
+}
+
+household <- household %>%
+  rename_keys() %>%
+  mutate(
+    household_key = paste(state_uf, psu_code, household_number, sep = "_"),
+    household_area = case_when(
+      household_area == "1" ~ "Urban",
+      household_area == "2" ~ "Rural",
+      TRUE ~ NA_character_
+    ),
+    electricity_frequency_code = how_often_is_electricity_from_the_general_grid_usually_available_for_this_household,
+    electricity_frequency = case_when(
+      electricity_frequency_code == "1" ~ "Always available",
+      electricity_frequency_code == "2" ~ "Daily for part of the day",
+      electricity_frequency_code == "3" ~ "Other pattern",
+      TRUE ~ NA_character_
+    )
+  )
+
+resident <- resident %>%
+  rename_keys() %>%
+  mutate(
+    hh_key = paste(state_uf, psu_code, household_number, sep = "_"),
+    total_income = as.numeric(total_gross_monthly_income_of_the_consumption_unit_r_including_cents_sum_of_monetary_incomes_plus_non_monetary_monthly_income_plus_asset_variation_property_sales_inheritances_net_financial_movement),
+    age = as.numeric(age_in_years)
+  )
+
+income_by_cu <- resident %>%
+  filter(!is.na(total_income)) %>%
+  group_by(hh_key, consumption_unit) %>%
+  summarise(consumption_income = max(total_income, na.rm = TRUE), .groups = "drop")
+
+household_income <- income_by_cu %>%
+  group_by(hh_key) %>%
+  summarise(
+    household_total_income = sum(consumption_income, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+member_summary <- resident %>%
+  group_by(hh_key) %>%
+  summarise(
+    hh_members = n(),
+    mean_age = mean(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    share_female = mean(sex == "2", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+inventory <- inventory %>%
+  rename_keys() %>%
+  rename(
+    product_code = codigo_do_tipo_de_despesa_aquisicao_neste_registro_o_codigo_do_item_e_sempre_0000101,
+    quantity = quantidade_final_consumida_em_kilowatt_kwh_apos_os_procedimentos_de_imputacao_aplicavel_apenas_para_o_item_energia_eletrica_v9001_600101_para_os_outros_itens_este_campo_esta_em_branco,
+    acquisition_form = forma_de_aquisicao_identifica_a_forma_pela_qual_o_tipo_de_produto_ou_servico_foi_adquirido_pela_unidade_de_consumo_no_periodo_de_referencia_da_pesquisa_no_caso_do_aluguel_estimado_a_forma_de_aquisicao_sera_sempre_11_outra,
+    last_acquisition_year = identifies_the_year_of_the_last_acquisition_of_the_durable_good_made_by_the_consumption_unit,
+    product_condition = estado_do_produto_adquirido_pela_unidade_de_consumo_no_periodo_de_referencia_da_pesquisa_aplicavel_apenas_para_os_quadros_15_16_17_e_18_para_os_outros_quadros_este_campo_esta_em_branco
+  ) %>%
+  mutate(
+    product_code = str_pad(str_trim(product_code), 7, pad = "0"),
+    quantity = as.numeric(quantity),
+    last_acquisition_year = as.integer(last_acquisition_year),
+    household_key = paste(state_uf, psu_code, household_number, sep = "_")
+  )
+
+appliance_codes <- list(
+  refrigerator = c("1400301", "1400401", "1501701"),
+  washing_machine = c("1401201", "1501901"),
+  dishwasher = c("1400801"),
+  dryer = c("1503402"),
+  stove = c("1400101", "1502101", "1600101", "1600201")
+)
+
+inventory <- inventory %>%
+  mutate(
+    has_refrigerator = product_code %in% appliance_codes$refrigerator,
+    has_washing_machine = product_code %in% appliance_codes$washing_machine,
+    has_dishwasher = product_code %in% appliance_codes$dishwasher,
+    has_dryer = product_code %in% appliance_codes$dryer,
+    has_stove = product_code %in% appliance_codes$stove
+  )
+
+appliance_summary <- inventory %>%
+  group_by(household_key) %>%
+  summarise(across(starts_with("has_"), ~ any(.x, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(appliance_count = rowSums(across(starts_with("has_")), na.rm = TRUE))
+
+washing_machine_purchase <- inventory %>%
+  filter(product_code %in% appliance_codes$washing_machine) %>%
+  group_by(household_key) %>%
+  summarise(last_washing_machine_year = max(last_acquisition_year, na.rm = TRUE), .groups = "drop") %>%
+  mutate(last_washing_machine_year = if_else(is.infinite(last_washing_machine_year), NA_integer_, last_washing_machine_year))
+
+analysis_df <- household %>%
+  left_join(member_summary, by = c("household_key" = "hh_key")) %>%
+  left_join(household_income, by = c("household_key" = "hh_key")) %>%
+  left_join(appliance_summary, by = "household_key") %>%
+  left_join(washing_machine_purchase, by = "household_key") %>%
+  mutate(
+    log_income = log1p(household_total_income),
+    per_capita_income = if_else(!is.na(household_total_income) & hh_members > 0,
+                                household_total_income / hh_members,
+                                NA_real_)
+  ) %>%
+  mutate(across(starts_with("has_"), ~ replace_na(.x, FALSE))) %>%
+  mutate(appliance_count = rowSums(across(starts_with("has_")), na.rm = TRUE))
+
+write_parquet(analysis_df, file.path(ANALYSIS_DIR, "household_panel.parquet"))
+```
+
+The household panel now contains translated location keys, income, household size, appliance indicators, and electricity-frequency text labels.
+
+## Summaries
+
+```{r summaries}
+income_deciles <- analysis_df %>%
+  filter(!is.na(household_total_income)) %>%
+  mutate(income_decile = ntile(household_total_income, 10)) %>%
+  group_by(income_decile) %>%
+  summarise(
+    avg_appliance_count = mean(appliance_count, na.rm = TRUE),
+    refrigerator_share = mean(has_refrigerator, na.rm = TRUE),
+    washing_machine_share = mean(has_washing_machine, na.rm = TRUE),
+    dishwasher_share = mean(has_dishwasher, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+frequency_summary <- analysis_df %>%
+  filter(!is.na(electricity_frequency)) %>%
+  group_by(electricity_frequency) %>%
+  summarise(
+    avg_appliance_count = mean(appliance_count, na.rm = TRUE),
+    washing_machine_share = mean(has_washing_machine, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(income_deciles, file.path(ANALYSIS_DIR, "income_decile_appliance_summary.csv"))
+write_csv(frequency_summary, file.path(ANALYSIS_DIR, "electricity_frequency_table.csv"))
+
+knitr::kable(income_deciles, caption = "Apartment ownership by income decile")
+knitr::kable(frequency_summary, caption = "Appliance ownership by electricity availability")
+```
+
+## Modeling
+
+```{r modeling}
+model_data <- analysis_df %>%
+  filter(!is.na(appliance_count), !is.na(log_income), !is.na(hh_members))
+
+model_income <- lm(appliance_count ~ log_income, data = model_data)
+model_size <- lm(appliance_count ~ log_income + hh_members, data = model_data)
+model_wm <- glm(has_washing_machine ~ electricity_frequency + log_income + hh_members + factor(state_uf),
+                data = model_data, family = binomial())
+model_year <- lm(last_washing_machine_year ~ electricity_frequency + log_income + hh_members + factor(state_uf),
+                 data = analysis_df %>% filter(!is.na(last_washing_machine_year)))
+
+model_summary <- bind_rows(
+  broom::tidy(model_income) %>% mutate(model = "appliance ~ log income"),
+  broom::tidy(model_size) %>% mutate(model = "appliance ~ log income + hh_size"),
+  broom::tidy(model_wm) %>% mutate(model = "washing_machine ~ electricity + controls"),
+  broom::tidy(model_year) %>% mutate(model = "washing_machine_year ~ electricity + controls")
+)
+
+write_csv(model_summary, file.path(ANALYSIS_DIR, "model_coefficients.csv"))
+
+knitr::kable(model_summary %>% filter(model %in% c("appliance ~ log income", "appliance ~ log income + hh_size")), caption = "Income-based appliance counts")
+knitr::kable(model_summary %>% filter(model == "washing_machine ~ electricity + controls"), caption = "Washing machine ownership logistic")
+knitr::kable(model_summary %>% filter(model == "washing_machine_year ~ electricity + controls"), caption = "Washing machine purchase year model")
+```
+
+## Electricity availability & Purchase Year
+
+```{r availability}
+availability_summary <- analysis_df %>%
+  filter(!is.na(electricity_frequency)) %>%
+  group_by(electricity_frequency) %>%
+  summarise(
+    wm_share = mean(has_washing_machine, na.rm = TRUE),
+    avg_income = mean(household_total_income, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(availability_summary, file.path(ANALYSIS_DIR, "electricity_availability_summary.csv"))
+knitr::kable(availability_summary, caption = "Washing machine share by electricity availability")
+```
+
+```{r purchase-years}
+purchase_by_frequency <- analysis_df %>%
+  filter(!is.na(last_washing_machine_year), !is.na(electricity_frequency)) %>%
+  group_by(electricity_frequency) %>%
+  summarise(
+    median_purchase_year = median(last_washing_machine_year, na.rm = TRUE),
+    data_points = n(),
+    .groups = "drop"
+  )
+
+write_csv(purchase_by_frequency, file.path(ANALYSIS_DIR, "washing_machine_purchase_years.csv"))
+knitr::kable(purchase_by_frequency, caption = "Median year of last washing machine purchase")
+```
+
+## Maps
+
+```{r maps, fig.width=8, fig.height=6}
+state_lookup <- tibble(
+  state_uf = c("11","12","13","14","15","16","17","21","22","23","24","25","26","27","28","29",
+               "31","32","33","35","41","42","43","50","51","52","53"),
+  state_name = c("Rondonia","Acre","Amazonas","Roraima","Para","Amapa","Tocantins","Maranhao",
+                 "Piaui","Ceara","Rio Grande do Norte","Paraiba","Pernambuco","Alagoas","Sergipe","Bahia",
+                 "Minas Gerais","Espirito Santo","Rio de Janeiro","Sao Paulo",
+                 "Parana","Santa Catarina","Rio Grande do Sul","Mato Grosso do Sul","Mato Grosso","Goias","Distrito Federal"),
+  region = c("North","North","North","North","North","North","North",
+             "Northeast","Northeast","Northeast","Northeast","Northeast","Northeast","Northeast","Northeast","Northeast",
+             "Southeast","Southeast","Southeast","Southeast","South","South","South","Center-West","Center-West","Center-West","Center-West")
+)
+
+state_summary <- analysis_df %>%
+  group_by(state_uf) %>%
+  summarise(
+    refrigerator_share = mean(has_refrigerator, na.rm = TRUE),
+    washing_machine_share = mean(has_washing_machine, na.rm = TRUE),
+    dishwasher_share = mean(has_dishwasher, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(state_lookup, by = "state_uf")
+
+state_map <- geobr::read_state(year = 2018, simplified = TRUE) %>%
+  mutate(state_uf = str_pad(code_state, 2, pad = "0")) %>%
+  left_join(state_summary, by = "state_uf")
+
+plot_map <- function(df, variable, title, filename) {
+  plt <- ggplot(df) +
+    geom_sf(aes(fill = .data[[variable]]), color = "gray70", size = 0.1) +
+    scale_fill_viridis_c(labels = percent_format(accuracy = 1), na.value = "gray90") +
+    labs(title = title, fill = "Share", caption = "POF 2017-2018") +
+    theme_void() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.position = "bottom")
+  ggsave(file.path(REPORTS_DIR, filename), plt, width = 8, height = 6)
+  print(plt)
+}
+
+plot_map(state_map, "refrigerator_share", "Refrigerator ownership share by state", "map_refrigerator.png")
+plot_map(state_map, "washing_machine_share", "Washing machine ownership share by state", "map_washing_machine.png")
+plot_map(state_map, "dishwasher_share", "Dishwasher ownership share by state", "map_dishwasher.png")
+```

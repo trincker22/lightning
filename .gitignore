@@ -1,21 +1,31 @@
-# Ignore data and large files
+# Ignore data 
 *.rds
 *.csv
 *.tif
 *.nc
 *.RData*
+*.feather
+*.xls
+*.xlsx
+*.parquet
+*.zip
+*.docx
+*.pdf
+*.png
+*.txt
+
 .RDataTmp
 .DS_Store
 
 # Ignore folders that store data
-ANEEL/
-Lightning/
-GADM/
-WBDB/
-CSVNew/
-CSV/
-Outputs/
-Downloads/
+#ANEEL/
+#Lightning/
+#GADM/
+#WBDB/
+#CSVNew/
+#CSV/
+#Outputs/
+#Downloads/
 
 # RStudio-related
 .Rproj.user/
