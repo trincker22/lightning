@@ -12,18 +12,18 @@ options(timeout = max(3600, getOption("timeout")))
 
 root_dir <- here::here()
 
-out_dir <- file.path(root_dir, "data", "powerIV", "outages")
-raw_dir <- file.path(out_dir, "raw")
-panel_dir <- file.path(out_dir, "panels")
-qa_dir <- file.path(out_dir, "qa")
-legacy_raw_dir <- file.path(root_dir, "data", "BrazilPowerPipeline", "outages", "raw")
+out_dir <- here::here("data", "powerIV", "outages")
+raw_dir <- here::here(out_dir, "raw")
+panel_dir <- here::here(out_dir, "panels")
+qa_dir <- here::here(out_dir, "qa")
+legacy_raw_dir <- here::here("data", "BrazilPowerPipeline", "outages", "raw")
 
 dir.create(raw_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(panel_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(qa_dir, recursive = TRUE, showWarnings = FALSE)
 
-panel_path <- file.path(panel_dir, "aneel_conj_monthly_outages.parquet")
-qa_path <- file.path(qa_dir, "aneel_conj_monthly_outages_qa.parquet")
+panel_path <- here::here(panel_dir, "aneel_conj_monthly_outages.parquet")
+qa_path <- here::here(qa_dir, "aneel_conj_monthly_outages_qa.parquet")
 
 if (all(file.exists(c(panel_path, qa_path)))) {
   message("All ANEEL continuity outputs already exist in data/powerIV. Skipping rebuild.")
@@ -138,8 +138,8 @@ if (nrow(resources) == 0) {
 local_files <- resources[
   ,
   {
-    dest <- file.path(raw_dir, name)
-    legacy <- file.path(legacy_raw_dir, name)
+    dest <- here::here(raw_dir, name)
+    legacy <- here::here(legacy_raw_dir, name)
     download_if_needed(url, dest, legacy_path = legacy)
   },
   by = .(name, url)

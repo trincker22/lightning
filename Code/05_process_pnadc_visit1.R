@@ -19,37 +19,37 @@ sf::sf_use_s2(FALSE)
 
 root_dir <- here::here()
 
-pnad_dir <- file.path(root_dir, "data", "PNAD-C")
-raw_dir <- file.path(pnad_dir, "raw")
-out_dir <- file.path(root_dir, "data", "powerIV", "pnadc")
-fig_dir <- file.path(root_dir, "Figures", "powerIV", "pnadc")
-shape_dir <- file.path(out_dir, "shapes")
-report_dir <- file.path(out_dir, "reports")
+pnad_dir <- here::here("data", "PNAD-C")
+raw_dir <- here::here(pnad_dir, "raw")
+out_dir <- here::here("data", "powerIV", "pnadc")
+fig_dir <- here::here("Figures", "powerIV", "pnadc")
+shape_dir <- here::here(out_dir, "shapes")
+report_dir <- here::here(out_dir, "reports")
 dir.create(raw_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(shape_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(report_dir, recursive = TRUE, showWarnings = FALSE)
 
-crosswalk_path <- file.path(pnad_dir, "Municipios_por_Estratos.csv")
-varbook_path <- file.path(raw_dir, "Variaveis_PNADC_Anual_Visita.xls")
-hh_out <- file.path(out_dir, "pnadc_visit1_household_2016_2024.parquet")
-panel_out <- file.path(out_dir, "pnadc_visit1_estrato_quarter_2016_2024.parquet")
-split_panel_out <- file.path(out_dir, "pnadc_visit1_estrato_quarter_urban_rural_2016_2024.parquet")
-crosswalk_out <- file.path(out_dir, "pnadc_estrato_municipio_crosswalk.parquet")
-shape_out <- file.path(shape_dir, "pnadc_estrato_146_2020.gpkg")
-continuity_out <- file.path(report_dir, "pnadc_visit1_variable_continuity.csv")
-continuity_md_out <- file.path(report_dir, "pnadc_visit1_variable_continuity.md")
-qa_out <- file.path(out_dir, "pnadc_visit1_processing_qa.csv")
+crosswalk_path <- here::here(pnad_dir, "Municipios_por_Estratos.csv")
+varbook_path <- here::here(raw_dir, "Variaveis_PNADC_Anual_Visita.xls")
+hh_out <- here::here(out_dir, "pnadc_visit1_household_2016_2024.parquet")
+panel_out <- here::here(out_dir, "pnadc_visit1_estrato_quarter_2016_2024.parquet")
+split_panel_out <- here::here(out_dir, "pnadc_visit1_estrato_quarter_urban_rural_2016_2024.parquet")
+crosswalk_out <- here::here(out_dir, "pnadc_estrato_municipio_crosswalk.parquet")
+shape_out <- here::here(shape_dir, "pnadc_estrato_146_2020.gpkg")
+continuity_out <- here::here(report_dir, "pnadc_visit1_variable_continuity.csv")
+continuity_md_out <- here::here(report_dir, "pnadc_visit1_variable_continuity.md")
+qa_out <- here::here(out_dir, "pnadc_visit1_processing_qa.csv")
 map_outputs <- c(
-  file.path(fig_dir, "map_1_electricity_from_grid_2016q1.png"),
-  file.path(fig_dir, "map_1_electricity_from_grid_2024q4.png"),
-  file.path(fig_dir, "map_2_grid_full_time_2016q1.png"),
-  file.path(fig_dir, "map_2_grid_full_time_2024q4.png"),
-  file.path(fig_dir, "map_3_washing_machine_2016q1.png"),
-  file.path(fig_dir, "map_3_washing_machine_2024q4.png"),
-  file.path(fig_dir, "map_4_cooking_wood_charcoal_2016q1.png"),
-  file.path(fig_dir, "map_4_cooking_wood_charcoal_2024q4.png")
+  here::here(fig_dir, "map_1_electricity_from_grid_2016q1.png"),
+  here::here(fig_dir, "map_1_electricity_from_grid_2024q4.png"),
+  here::here(fig_dir, "map_2_grid_full_time_2016q1.png"),
+  here::here(fig_dir, "map_2_grid_full_time_2024q4.png"),
+  here::here(fig_dir, "map_3_washing_machine_2016q1.png"),
+  here::here(fig_dir, "map_3_washing_machine_2024q4.png"),
+  here::here(fig_dir, "map_4_cooking_wood_charcoal_2016q1.png"),
+  here::here(fig_dir, "map_4_cooking_wood_charcoal_2024q4.png")
 )
 
 required_outputs <- c(
@@ -63,6 +63,50 @@ required_outputs <- c(
   qa_out,
   map_outputs
 )
+
+as_yes_no_binary <- function(x) {
+  x_chr <- str_to_lower(str_trim(as.character(x)))
+  case_when(
+    is.na(x_chr) | x_chr == "" ~ NA_integer_,
+    str_detect(x_chr, regex("\\bsim\\b|^1\\b", ignore_case = TRUE)) ~ 1L,
+    str_detect(x_chr, regex("\\bnao\\b|\\bnão\\b|^2\\b", ignore_case = TRUE)) ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+first_non_missing <- function(x) {
+  idx <- which(!is.na(x) & x != "")
+  if (length(idx) == 0) NA_character_ else as.character(x[[idx[[1]]]])
+}
+
+weighted_share <- function(x, w) {
+  keep <- !is.na(x) & !is.na(w)
+  if (!any(keep)) {
+    return(NA_real_)
+  }
+  weighted.mean(as.numeric(x[keep]), w[keep], na.rm = TRUE)
+}
+
+weighted_mean_num <- function(x, w) {
+  keep <- !is.na(x) & !is.na(w)
+  if (!any(keep)) {
+    return(NA_real_)
+  }
+  weighted.mean(as.numeric(x[keep]), w[keep], na.rm = TRUE)
+}
+
+make_map <- function(data_sf, value_col, title_text, subtitle_text, out_path) {
+  p <- ggplot(data_sf) +
+    geom_sf(aes(fill = .data[[value_col]]), color = "grey60", linewidth = 0.1) +
+    scale_fill_viridis_c(labels = scales::percent_format(accuracy = 1), na.value = "grey90") +
+    labs(title = title_text, subtitle = subtitle_text, fill = "Share") +
+    theme_void() +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+  ggsave(out_path, p, width = 10, height = 7, dpi = 300)
+}
 
 if (all(file.exists(required_outputs))) {
   message("All PNAD-C visit 1 outputs already exist in data/powerIV. Skipping rebuild.")
@@ -439,56 +483,56 @@ make_map(
   "share_electricity_from_grid",
   "PNAD-C 2016 Q1: electricity from main grid",
   "146 geographic strata",
-  file.path(fig_dir, "map_1_electricity_from_grid_2016q1.png")
+  here::here(fig_dir, "map_1_electricity_from_grid_2016q1.png")
 )
 make_map(
   latest_map_sf,
   "share_electricity_from_grid",
   "PNAD-C 2024 Q4: electricity from main grid",
   "146 geographic strata",
-  file.path(fig_dir, "map_1_electricity_from_grid_2024q4.png")
+  here::here(fig_dir, "map_1_electricity_from_grid_2024q4.png")
 )
 make_map(
   start_map_sf,
   "share_grid_full_time",
   "PNAD-C 2016 Q1: full-time grid availability",
   "146 geographic strata",
-  file.path(fig_dir, "map_2_grid_full_time_2016q1.png")
+  here::here(fig_dir, "map_2_grid_full_time_2016q1.png")
 )
 make_map(
   latest_map_sf,
   "share_grid_full_time",
   "PNAD-C 2024 Q4: full-time grid availability",
   "146 geographic strata",
-  file.path(fig_dir, "map_2_grid_full_time_2024q4.png")
+  here::here(fig_dir, "map_2_grid_full_time_2024q4.png")
 )
 make_map(
   start_map_sf,
   "share_washing_machine",
   "PNAD-C 2016 Q1: washing machine ownership",
   "146 geographic strata",
-  file.path(fig_dir, "map_3_washing_machine_2016q1.png")
+  here::here(fig_dir, "map_3_washing_machine_2016q1.png")
 )
 make_map(
   latest_map_sf,
   "share_washing_machine",
   "PNAD-C 2024 Q4: washing machine ownership",
   "146 geographic strata",
-  file.path(fig_dir, "map_3_washing_machine_2024q4.png")
+  here::here(fig_dir, "map_3_washing_machine_2024q4.png")
 )
 make_map(
   start_map_sf,
   "share_cooking_wood_charcoal",
   "PNAD-C 2016 Q1: wood/charcoal used for food preparation",
   "146 geographic strata",
-  file.path(fig_dir, "map_4_cooking_wood_charcoal_2016q1.png")
+  here::here(fig_dir, "map_4_cooking_wood_charcoal_2016q1.png")
 )
 make_map(
   latest_map_sf,
   "share_cooking_wood_charcoal",
   "PNAD-C 2024 Q4: wood/charcoal used for food preparation",
   "146 geographic strata",
-  file.path(fig_dir, "map_4_cooking_wood_charcoal_2024q4.png")
+  here::here(fig_dir, "map_4_cooking_wood_charcoal_2024q4.png")
 )
 
 qa <- bind_rows(

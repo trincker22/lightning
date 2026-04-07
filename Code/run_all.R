@@ -18,7 +18,7 @@ file_arg <- grep("^--file=", args, value = TRUE)
 code_dir <- here("Code")
 
 for (s in scripts) {
-  path <- file.path(code_dir, s)
+  path <- here::here(code_dir, s)
   message("Running ", basename(path))
   status <- system2("Rscript", path)
   if (!identical(status, 0L)) stop("Failed: ", s)

@@ -14,27 +14,52 @@ suppressPackageStartupMessages({
 
 root_dir <- here::here()
 
-input_nc <- file.path(root_dir, "data", "Lightning", "WGLC", "wglc_timeseries_05m.nc")
-output_dir <- file.path(root_dir, "data", "powerIV", "lightning")
-raster_dir <- file.path(output_dir, "rasters")
-panel_dir <- file.path(output_dir, "panels")
-shape_dir <- file.path(output_dir, "shapes")
+lightning_dir <- here::here("data", "Lightning", "WGLC")
+nc_files <- list.files(lightning_dir, pattern = "\\.nc$", full.names = TRUE)
+if (length(nc_files) == 0) {
+  stop("No NetCDF file found in ", lightning_dir)
+}
+preferred_nc <- nc_files[grepl("05m", basename(nc_files), ignore.case = TRUE)]
+if (length(preferred_nc) > 0) {
+  input_nc <- preferred_nc[which.max(file.info(preferred_nc)$mtime)]
+} else {
+  input_nc <- nc_files[which.max(file.info(nc_files)$mtime)]
+}
+output_dir <- here::here("data", "powerIV", "lightning")
+raster_dir <- here::here(output_dir, "rasters")
+panel_dir <- here::here(output_dir, "panels")
+shape_dir <- here::here(output_dir, "shapes")
 
 dir.create(raster_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(panel_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(shape_dir, recursive = TRUE, showWarnings = FALSE)
 
-masked_raster_path <- file.path(raster_dir, "wglc_density_monthly_total_brazil_2010_2021.tif")
-intermediate_panel_path <- file.path(panel_dir, "wglc_density_monthly_intermediate_region_2010_2021.parquet")
-intermediate_shape_path <- file.path(shape_dir, "ibge_intermediate_regions_2020.gpkg")
+masked_raster_path <- here::here(raster_dir, "wglc_density_monthly_total_brazil_2010_2021.tif")
+intermediate_panel_path <- here::here(panel_dir, "wglc_density_monthly_intermediate_region_2010_2021.parquet")
+intermediate_shape_path <- here::here(shape_dir, "ibge_intermediate_regions_2020.gpkg")
 
-if (all(file.exists(c(masked_raster_path, intermediate_panel_path, intermediate_shape_path)))) {
-  message("All lightning outputs already exist in data/powerIV. Skipping rebuild.")
-  quit(save = "no", status = 0)
+message("Reading WGLC density raster.")
+message("Using NetCDF file: ", input_nc)
+density <- terra::rast(input_nc)
+
+raw_time <- terra::time(density)
+if (!all(is.na(raw_time))) {
+  dates <- as.Date(raw_time)
+} else {
+  start_date <- as.Date("2010-01-01")
+  dates <- seq.Date(from = start_date, by = "month", length.out = terra::nlyr(density))
 }
 
-if (!file.exists(input_nc)) {
-  stop("Missing input NetCDF: ", input_nc)
+if (all(file.exists(c(masked_raster_path, intermediate_panel_path, intermediate_shape_path)))) {
+  existing_panel_dates <- arrow::read_parquet(intermediate_panel_path, col_select = "date")$date
+  panel_is_current <- length(existing_panel_dates) > 0 &&
+    min(existing_panel_dates, na.rm = TRUE) <= min(dates, na.rm = TRUE) &&
+    max(existing_panel_dates, na.rm = TRUE) >= max(dates, na.rm = TRUE)
+  if (panel_is_current) {
+    message("All lightning outputs already exist in data/powerIV and cover current source dates. Skipping rebuild.")
+    quit(save = "no", status = 0)
+  }
+  message("Existing lightning outputs are stale; rebuilding with expanded source coverage.")
 }
 
 message("Reading Brazil geometry and intermediate regions.")
@@ -48,11 +73,6 @@ intermediate_regions <- geobr::read_intermediate_region(
 ) |>
   sf::st_transform(4326)
 
-message("Reading WGLC density raster.")
-density <- terra::rast(input_nc)
-
-start_date <- as.Date("2010-01-01")
-dates <- seq.Date(from = start_date, by = "month", length.out = terra::nlyr(density))
 days_per_month <- lubridate::days_in_month(dates)
 
 message("Cropping and masking to Brazil.")

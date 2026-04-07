@@ -11,18 +11,18 @@ suppressPackageStartupMessages({
 
 root_dir <- here::here()
 
-bdgd_gpkg_dir <- file.path(root_dir, "data", "ANEEL", "BDGD_CONJ", "gpkg")
-out_dir <- file.path(root_dir, "data", "powerIV", "outages")
-shape_dir <- file.path(out_dir, "shapes")
-qa_dir <- file.path(out_dir, "qa")
-panel_path <- file.path(out_dir, "panels", "aneel_conj_monthly_outages.parquet")
+bdgd_gpkg_dir <- here::here("data", "ANEEL", "BDGD_CONJ", "gpkg")
+out_dir <- here::here("data", "powerIV", "outages")
+shape_dir <- here::here(out_dir, "shapes")
+qa_dir <- here::here(out_dir, "qa")
+panel_path <- here::here(out_dir, "panels", "aneel_conj_monthly_outages.parquet")
 
 dir.create(shape_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(qa_dir, recursive = TRUE, showWarnings = FALSE)
 
-all_vintages_gpkg_path <- file.path(shape_dir, "aneel_conj_all_vintages.gpkg")
-match_path <- file.path(qa_dir, "aneel_conj_outage_nearest_geometry_match.parquet")
-coverage_path <- file.path(qa_dir, "aneel_conj_vintage_match_coverage.parquet")
+all_vintages_gpkg_path <- here::here(shape_dir, "aneel_conj_all_vintages.gpkg")
+match_path <- here::here(qa_dir, "aneel_conj_outage_nearest_geometry_match.parquet")
+coverage_path <- here::here(qa_dir, "aneel_conj_vintage_match_coverage.parquet")
 
 if (all(file.exists(c(all_vintages_gpkg_path, match_path, coverage_path)))) {
   message("All CONJ geometry outputs already exist in data/powerIV. Skipping rebuild.")
